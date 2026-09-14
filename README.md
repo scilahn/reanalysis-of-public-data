@@ -1,4 +1,4 @@
-# Single-cell analyses
+# Reanalysis of public data
 
 This is a repo of re-analyses of published sc/snRNA-seq datasets by indication.
 
