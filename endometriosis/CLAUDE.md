@@ -12,18 +12,28 @@ Reference paper: Mareckova et al., Nature Genetics 2024, `s41588-024-01873-w` (H
 
 Budget: the challenge suggests ~6 hours. Spend compute where it matters (the disease signal), not on re-integrating the full atlas.
 
-## The scientific thesis is already decided. Do not relitigate it.
+## The scientific conclusion. Do not reverse it without new evidence.
 
-Headline insight: endometriosis has no disease-specific cell type. The signal is a rewiring of programs inside existing cells. The two compartments implicated by both differential abundance and functional GWAS in the paper are decidualized stromal cells and macrophages. They converge on one druggable node: IGF1.
+The notebook has been run and its conclusion is settled. Read section 6 before proposing changes.
 
-The argument the notebook builds:
-1. Within-cell-type differential expression (case vs control) recovers IGF1 up in uM2 macrophages and an inflammatory shift (TNFRSF1B, CEBPD) in uM1.
-2. The same IGF1 upregulation appears in decidualized stromal cells, so the two GWAS-anchored cell types share a node.
-3. IGF1 is targetable and disease-relevant: macrophage-derived IGF1 sensitizes pelvic nerves, peritoneal IGF1 tracks with patient pain scores, and the IGF-1R inhibitor linsitinib reverses pain behavior in preclinical endometriosis models.
+Headline result: endometriosis has no disease-specific cell type, and on this atlas the case/control expression signal the reference reports does not survive batch control. IGF1 is not supported here.
 
-Therapeutic hypothesis: IGF-1R inhibition as a pain-directed, genetically anchored intervention with existing clinical-stage chemistry.
+What the notebook establishes:
+1. The seven source datasets are partly separated by condition, several entirely cases or entirely controls, so a pooled `~ condition` contrast reports dataset-of-origin as disease.
+2. Under donor-level replication with `~ dataset + condition`, restricted to datasets holding both arms, IGF1 does not reach significance in uM2 macrophages, uM1 macrophages, or decidualized stroma. The macrophage compartment yields no genes at FDR < 0.05. The strong stromal IGF2 effect is a dataset main effect that disappears under adjustment.
+3. Exogenous-hormone treatment is confounded with case status. Adjusting for it moves IGF1 toward the reference's case-up direction in every compartment but never clears significance. The closest any test comes is p about 0.10 in stroma under limma-voom.
+4. Nothing reproduces across datasets. Fold-changes fit independently in Mareckova and Huang do not correlate (section 8a), and this holds across every cell type (section 5h) and for differential abundance (section 8c), where per-cell-type shifts anti-correlate between datasets.
+5. It is not a method artifact. Section 8b reproduces the reference's exact limma-voom with three metacells per donor and returns the same IGF1 null. The divergence is their design and replication choices, not the DE test.
 
-If you think a different angle is stronger, raise it as a question first. Do not silently redirect the analysis.
+Scope of the negative, and keep it this precise: it concerns the reference's scRNA-seq differential expression. It does not cover their differential abundance, which they ran on single-nuclei data, or their functional GWAS.
+
+What the atlas does support, as leads to test rather than targets it establishes: CRIP1 in secretory/luminal epithelium, the one externally-defined gene (Fonseca et al. 2023) holding its case-up direction across both independent datasets, and a directionally reproducible but faint TGF-beta / angiogenesis program in the functionalis (SOX9) epithelium.
+
+Therapeutic hypothesis: IGF-1R inhibition remains defensible, but on external evidence only (Forster et al. 2019 on macrophage-derived IGF1 and nerve sensitization; linsitinib's clinical-stage safety data). This atlas does not provide the transcriptomic anchor. Do not conflate the two.
+
+(Superseded 2026-08-11. The prior going in, which the run overturned, was: the compartments implicated by differential abundance and functional GWAS, decidualized stroma and macrophages, converge on one druggable node, IGF1, recovered as IGF1 up in uM2 macrophages with an inflammatory shift in uM1, giving IGF-1R inhibition as a genetically anchored intervention. The notebook is structured as a test of exactly that thesis, which is why so much of it is batch-control and reproducibility machinery. Retained here because it explains the notebook's shape.)
+
+If you think the conclusion is wrong, raise it as a question with the evidence first. Do not silently redirect the analysis in either direction.
 
 ## Data
 
@@ -99,7 +109,7 @@ Config-driven. The only cell that should need editing per environment is the Con
 2. Load and inspect (prints schema so Config can be set)
 3. QC and normalization (validation of the shipped object against paper thresholds, plus normalize for expression work; not a re-derivation)
 4. Annotation: 4a validate shipped labels with markers, 4b de novo re-annotate the immune compartment
-5. Disease signal: 5a composition (exploratory only), 5b within-cell-type pseudobulk DESeq2 (primary), 5c IGF1 convergence check
+5. Disease signal: 5a composition (exploratory only), 5b within-cell-type pseudobulk DESeq2 (primary, varying replication unit and design), 5e sample-level structure (PCA, cross-dataset classifier transfer, module scores), 5f Mareckova alone, 5h all-cell-type scan plus the Fonseca et al. 2023 external signature, 5i bulk EndMT signature (Liang et al. 2025), 5j GSEA, 5k per-cell-type within-dataset predictors
 6. Biological insight and therapeutic hypothesis (markdown)
 7. Reproducibility notes
 
@@ -115,7 +125,7 @@ These are deliberate and signal the seniority the reviewers are checking for. Do
 
 ## Differential expression recipe (the primary evidence)
 
-Chosen approach: Python pseudobulk aggregation, then DESeq2 via `pydeseq2`. This is a deliberate choice against the authors' limma-voom. Pseudobulk methods (DESeq2, edgeR, limma-voom) are well calibrated and largely concordant, so the top hits (IGF1) should survive the method change. Name the choice in markdown and cite the authors' notebook.
+Chosen approach: Python pseudobulk aggregation, then DESeq2 via `pydeseq2`. This is a deliberate choice against the authors' limma-voom. Pseudobulk methods (DESeq2, edgeR, limma-voom) are well calibrated and largely concordant, so a real top hit should survive the method change. Name the choice in markdown and cite the authors' notebook. (The cross-check was carried out rather than assumed: section 8b reproduces the authors' exact limma-voom via `rpy2`, across the same replication and design grid, and returns the same IGF1 null. The method is therefore ruled out as the source of the divergence from the reference.)
 
 Rules:
 - Replication unit is the donor. Build one pseudosample per donor per cell type. Not cells. Aggregate raw counts (decoupler `get_pseudobulk`, or a manual per-donor sum).
@@ -143,6 +153,8 @@ Expected case vs control DE (from paper Fig 5, use to sanity-check, not to hardc
 - Decidualized stromal: IGF1 up, IGF2 down, GREB1 up, DKK1 down.
 - IGF-axis genes the authors track: IGF1, IGF2, IGF1R, IGFBP1, IGFBP3, INSR, IRS2, DKK1, GREB1.
 
+None of these expected hits reproduced under batch-controlled, donor-level DE. They stay here as the paper's reported result, useful for checking that a pipeline recovers the naive-pooled contrast before batch control removes it, not as findings of this reanalysis.
+
 ## Writing conventions for the notebook markdown
 
 This is a submission that a scientific team will read. The prose should read as written by Richard.
@@ -159,7 +171,7 @@ This is a submission that a scientific team will read. The prose should read as 
 - Add packages with `uv add` so they land in the lockfile. Do not `pip install` into a stray interpreter.
 - Do not commit the `.h5ad` files. Add `*.h5ad` and `.venv/` to `.gitignore`. Do commit `pyproject.toml` and `uv.lock`.
 - Do not change the method decisions or the DE recipe above without flagging it. The donor-as-covariate point in particular is a correctness issue, not a style preference.
-- If the run surfaces a result that contradicts the IGF1 thesis, say so plainly rather than forcing the narrative. An honest negative is fine and worth reporting.
+- The run did contradict the IGF1 thesis, and the notebook says so plainly. Keep it that way. Do not soften the negative into a positive, and do not let a naive-pooled result be reported as a disease finding. An honest negative is the result here.
 
 ## Rules for Claude when working with Jupyter notebooks
 
