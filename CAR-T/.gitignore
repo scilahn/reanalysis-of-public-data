@@ -1,0 +1,7 @@
+# Raw + processed data: large, regenerable from GEO GSE207192
+data/
+
+# Quarto build artifacts
+*_files/
+*_cache/
+.quarto/

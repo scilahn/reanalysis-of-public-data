@@ -2,6 +2,47 @@
 
 This is a repo of re-analyses of published sc/snRNA-seq datasets by indication.
 
+## `CAR-T/`
+
+scRNA-seq + CITE-seq + TCR-seq of CD19 CAR T cells, tracking clones from the infusion product
+into blood across three post-infusion phases.
+
+The cohort is seven complete responders, each with the residual infusion product plus three
+sorted blood draws — expansion (d8–12), persistence 1 (d21) and persistence 2 (d28). Because
+every patient responded, the question this supports is clone *fate*, not response.
+
+The headline finding is negative, and it is a negative about method as much as biology. The
+reference argues that the clones dominating the expansion peak and those dominating
+persistence derive from different infusion-product precursors. Mapping fate-classified clones
+back to product transcriptional clusters appears to confirm it emphatically — CD8 effector
+precursors enriched in persistence-biased clones, Tc2-like precursors depleted, at cell-level
+FDRs down to 1e-18. None of it survives. Cells within a clone are clonal descendants rather
+than independent observations, and fate class is unbalanced across patients; testing one
+observation per clone with patient adjustment leaves nothing significant across clusters,
+effector/memory marker genes, or the CITE-seq panel. The same pattern recurs elsewhere in the
+analysis: a product-phenotype association that looks strong pooled (Spearman 0.37) collapses
+within patients (0.04), which is Simpson's paradox rather than signal.
+
+One limit is structural rather than statistical. Clones large enough to track reliably are by
+construction the clonally expanded ones, and those sit in effector and proliferating clusters —
+the memory clusters contribute one and three cells. The memory-precursor hypothesis therefore
+cannot be tested in this design at any sample size; it needs clone tracking that does not
+condition on product abundance, such as bulk TCR-seq. A suggestive association does survive —
+clones with lower CAR transgene expression in the product persist better, with a clean
+dose-response — but it weakens under stricter measurement filters and is offered as a
+hypothesis, not a result.
+
+The reanalysis also documents several properties of the deposited data that constrain what it
+can answer: the CAR and CD3 CITE-seq channels are effectively absent after infusion (the
+anti-CD3 antibody was deliberately omitted, and the panel's "CAR" feature is not among the 31
+documented reagents), monocyte and NK contamination survives the CD3+ sort in some libraries,
+and CAR status after infusion rests on the sort design rather than any measured signal — though
+the CAR transgene is recoverable from the RNA.
+
+- **Deliverable:** [`reanalysis-cao-2025.qmd`](CAR-T/reanalysis-cao-2025.qmd) and its rendered, self-contained [`reanalysis-cao-2025.html`](CAR-T/reanalysis-cao-2025.html). GitHub will not render the HTML inline — download it and open it in a browser, or view it through a raw-HTML viewer.
+- **Data:** GEO `GSE207192`, processed matrices only, from Cao et al., *Nature Communications* 2025.
+- **Stack:** R / Seurat + Harmony + scDblFinder, authored in Quarto.
+
 ## `endometriosis/`
 
 scRNA-seq of the Human Endometrial Cell Atlas (HECA), endometriosis cases versus controls.
@@ -51,8 +92,8 @@ controls through advanced MASH.
 
 ## Reproducing
 
-Neither folder ships its input data — both datasets are large and publicly available at the
-accessions above. Download the data for the analysis you want to run, point the config at
+None of these folders ship their input data — the datasets are large and publicly available
+at the accessions above. Download the data for the analysis you want to run, point the config at
 it, and execute the notebook or render the `.qmd`.
 
 The `CLAUDE.md` in each folder documents that project's methods, design decisions, and the

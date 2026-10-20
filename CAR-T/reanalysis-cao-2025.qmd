@@ -1,0 +1,2299 @@
+---
+title: "Re-analysis of Cao et al. 2025 (GSE207192)"
+author: "Richard Ahn"
+format:
+  html:
+    toc: true
+    toc-location: left
+    toc-depth: 3
+    code-fold: show
+    embed-resources: true
+execute:
+  warning: true
+  message: false
+  cache: true      # chunk-level cache; first render after this populates it
+  autodep: true    # track object dependencies between chunks
+---
+
+## Setup
+
+```{r}
+#| label: setup
+library(Seurat)
+library(Matrix)
+library(data.table)
+
+geo_dir  <- "data/raw/geo"
+proc_dir <- "data/processed"
+dir.create(proc_dir, showWarnings = FALSE, recursive = TRUE)
+
+geo_file <- function(...) file.path(geo_dir, paste0("GSE207192_", ...))
+
+# formatting helpers for numbers quoted inline in the prose
+fmt_n <- function(x) format(x, big.mark = ",", scientific = FALSE, trim = TRUE)
+fmt_e <- function(x) sprintf("%.1e", x)
+```
+
+## Load the processed GEO matrices
+
+GEO provides one RNA matrix and one ADT matrix per stage (pre- and post-infusion), stored as
+genes × cells in Matrix Market format. Gene names, protein names and cell barcodes are in separate
+one-column CSVs. Both modalities share a single cell barcode file per stage.
+
+```{r}
+#| label: load-fn
+read_names <- function(path) fread(path, header = TRUE)[[1]]
+
+load_stage <- function(stage) {
+  rna <- as(readMM(geo_file(stage, "_Infusion_scRNA_Raw_Counts.mtx.gz")), "CsparseMatrix")
+  adt <- as(readMM(geo_file(stage, "_Infusion_ADT_Raw_Counts.mtx.gz")), "CsparseMatrix")
+
+  rna_features <- read_names(geo_file(stage, "_Infusion_scRNA_Raw_Counts_features_rownames.csv.gz"))
+  adt_features <- read_names(geo_file(stage, "_Infusion_scADT_Raw_Counts_features_rownames.csv.gz"))
+  cells        <- read_names(geo_file(stage, "_Infusion_scADT_and_scRNA_Raw_Counts_cells_colnames.csv.gz"))
+  meta         <- fread(geo_file(stage, "_Infusion_scADT_and_scRNA_Raw_Counts_metaData.csv.gz"),
+                        colClasses = "character")
+
+  # Dimensions must line up with the name files before we attach names
+  stopifnot(
+    nrow(rna) == length(rna_features), ncol(rna) == length(cells),
+    nrow(adt) == length(adt_features), ncol(adt) == length(cells),
+    !anyDuplicated(cells)
+  )
+
+  dimnames(rna) <- list(make.unique(rna_features), cells)
+  dimnames(adt) <- list(adt_features, cells)
+
+  # Metadata must cover exactly the same cells, in the same order
+  stopifnot(identical(meta$cells, cells))
+  meta <- as.data.frame(meta)
+  rownames(meta) <- meta$cells
+  meta$cells <- NULL
+
+  obj <- CreateSeuratObject(counts = rna, assay = "RNA", project = paste0(stage, "_Infusion"),
+                            meta.data = meta)
+  obj[["ADT"]] <- CreateAssay5Object(counts = adt)
+  obj$stage <- stage
+  obj
+}
+```
+
+```{r}
+#| label: load
+pre  <- load_stage("Pre")
+post <- load_stage("Post")
+pre
+post
+```
+
+```{r}
+#| label: feature-checks
+# Duplicated gene symbols in the GEO file (made unique with a .1 suffix on load)
+raw_genes <- read_names(geo_file("Pre", "_Infusion_scRNA_Raw_Counts_features_rownames.csv.gz"))
+raw_genes[duplicated(raw_genes)]
+
+# ADT panel (Seurat swaps any "_" for "-")
+rownames(pre[["ADT"]])
+# Same 32 proteins in both stages, but in a different order (CD45RA is last in pre, first in post)
+setequal(rownames(pre[["ADT"]]), rownames(post[["ADT"]]))
+identical(rownames(pre[["ADT"]]), rownames(post[["ADT"]]))
+identical(rownames(pre[["RNA"]]), rownames(post[["RNA"]]))
+
+# Cells with no ADT counts at all
+sapply(list(pre = pre, post = post), function(o) sum(o$nCount_ADT == 0))
+table(post$orig.ident[post$nCount_ADT == 0])
+```
+
+## Metadata
+
+```{r}
+#| label: metadata
+head(pre[[]])
+head(post[[]])
+
+table(pre$patientShort, pre$patient)
+table(post$patientShort, post$time)
+table(pre$Final_celltype)
+table(post$Final_celltype)
+```
+
+## Cell barcode format
+
+Every barcode should look like `<sample prefix>_<16-nt 10x barcode>-1`.
+
+```{r}
+#| label: barcode-format
+barcode_re <- "^([^_]+)_([ACGT]{16})-([0-9]+)$"
+
+check_barcodes <- function(obj) {
+  bc <- colnames(obj)
+  ok <- grepl(barcode_re, bc)
+  list(
+    n_cells        = length(bc),
+    n_bad_format   = sum(!ok),
+    gem_suffixes   = table(sub(barcode_re, "\\3", bc[ok])),
+    n_dup_core_bc  = sum(duplicated(sub(barcode_re, "\\1_\\2", bc[ok]))),
+    prefixes       = table(prefix = sub(barcode_re, "\\1", bc[ok]))
+  )
+}
+
+check_barcodes(pre)
+check_barcodes(post)
+```
+
+### Does the barcode prefix agree with the metadata?
+
+Pre-infusion prefixes are the patient ID, but the style varies: `P033`, `P034` and `P049` keep the
+"P", while `031`, `039`, `048` and `116` drop it. Post-infusion prefixes follow
+`<patient>-<day>-<sort label>` (e.g. `031-d10-CART`).
+
+```{r}
+#| label: prefix-vs-meta
+pre_prefix <- sub(barcode_re, "\\1", colnames(pre))
+table(prefix = pre_prefix, patient = pre$patient)
+
+post_prefix <- sub(barcode_re, "\\1", colnames(post))
+post_parts  <- tstrsplit(post_prefix, "-")
+post_check  <- data.frame(
+  prefix        = post_prefix,
+  prefix_pt     = paste0("P", post_parts[[1]]),
+  prefix_day    = post_parts[[2]],
+  meta_patient  = post$patient,
+  meta_time     = post$time
+)
+post_check$patient_match <- post_check$prefix_pt  == post_check$meta_patient
+post_check$day_match     <- post_check$prefix_day == post_check$meta_time
+
+unique(post_check[!(post_check$patient_match & post_check$day_match),
+                  c("prefix", "meta_patient", "meta_time")])
+table(mismatch = !(post_check$patient_match & post_check$day_match))
+```
+
+### Summary of checks
+
+- **Format:** all 23,663 pre-infusion and 55,185 post-infusion barcodes match
+  `<prefix>_<16-nt barcode>-1`. Every cell has GEM suffix `-1`, and no barcode is duplicated.
+- **Metadata:** cell order in the metadata files matches the matrix columns exactly in both stages.
+- **Pre-infusion prefixes:** inconsistent style (`P033` vs `031`), but every prefix maps to one
+  patient. The `patient` column has no "P" here (`033`), whereas post-infusion uses `P034`.
+- **Pre-infusion P06 (patient 048):** only 4 cells.
+- **Post-infusion `028-d04-nonT` (25 cells):** the barcode prefix says patient 028, day 4, but the
+  metadata says P034 at d05. These cells also have zero ADT counts. They are the only mismatch
+  and are probably a small non-T control sample. Flag them before any per-patient analysis.
+- **ADT panel:** the same 32 proteins in both stages, in a different order.
+
+## Match TCR data to the count matrices
+
+The TCR tables come from `cellranger vdj aggr` across all 30 libraries (7 pre-infusion and 23
+post-infusion). Aggregation drops the sample prefix and appends a library number instead
+(`AAACCTGAGAAGGTGA-1`, `...-2`, …). 10x reuses the same barcode list in every library, so the
+16-nt barcode alone does not identify a cell. We have to work out which suffix belongs to which
+sample, then join on barcode **plus** suffix.
+
+### Suffix → library map
+
+The contig table records `donor`, `origin` and `Meta:time` for each cell, so the map comes from
+the data itself.
+
+```{r}
+#| label: tcr-load
+contigs <- fread(geo_file("All_TCR_Aggregated_filtered_contig_annotations.csv.gz"))
+stopifnot(all(grepl("^[ACGT]{16}-[0-9]+$", contigs$barcode)))
+contigs[, `:=`(core = sub("-[0-9]+$", "", barcode),
+               sfx  = as.integer(sub("^.*-", "", barcode)))]
+
+# All contigs are already filtered: cells, productive, high-confidence
+contigs[, .N, by = .(is_cell, productive, high_confidence, `Meta:celltype`)]
+
+lib_map <- unique(contigs[, .(sfx, donor, time = `Meta:time`, origin)])[order(sfx)]
+# Each suffix is one library, and each donor + day is one suffix
+stopifnot(!anyDuplicated(lib_map$sfx), !anyDuplicated(lib_map[, .(donor, time)]))
+lib_map[, n_tcr_cells := contigs[, uniqueN(barcode), by = sfx][lib_map, on = "sfx", V1]]
+lib_map
+```
+
+Suffixes 1–23 are the post-infusion timepoints and 24–30 are pre-infusion (`d00`), one per
+patient.
+
+### Assign each GEX cell its expected suffix
+
+We assign suffixes from the cell metadata (`patient` + `time`, with pre-infusion set to `d00`), not
+from the barcode prefix. That matters for the 25 `028-d04-nonT` cells, whose prefix disagrees
+with their metadata (see above).
+
+```{r}
+#| label: gex-suffix
+gex_cells <- function(obj, stage) {
+  data.table(
+    cell   = colnames(obj),
+    stage  = stage,
+    prefix = sub(barcode_re, "\\1", colnames(obj)),
+    core   = sub(barcode_re, "\\2", colnames(obj)),
+    donor  = as.integer(sub("^P", "", obj$patient)),
+    time   = if (stage == "Pre") "d00" else obj$time
+  )
+}
+gex <- rbind(gex_cells(pre, "Pre"), gex_cells(post, "Post"))
+gex <- lib_map[, .(donor, time, sfx, origin)][gex, on = .(donor, time)]
+stopifnot(!anyNA(gex$sfx))
+
+unique(gex[, .(stage, prefix, donor, time, sfx, origin)])[order(sfx)]
+```
+
+### Check the map against the barcodes themselves
+
+This check doesn't use the metadata. For each GEX sample, we find the TCR suffix where its
+16-nt barcodes most often appear. If the map is right, that suffix should be the one assigned
+above.
+
+```{r}
+#| label: suffix-crosscheck
+tcr_core <- unique(contigs[, .(core, sfx)])
+hits <- merge(gex[, .(prefix, core)], tcr_core, by = "core", allow.cartesian = TRUE)
+
+top_hit <- hits[, .N, by = .(prefix, hit_sfx = sfx)
+              ][, share := N / sum(N), by = prefix
+              ][order(-N)][, .SD[1], by = prefix]
+
+crosscheck <- unique(gex[, .(prefix, sfx, origin)])[top_hit, on = "prefix"]
+crosscheck[, agrees := sfx == hit_sfx]
+crosscheck[order(sfx), .(prefix, origin, expected_sfx = sfx, top_hit_sfx = hit_sfx,
+                         share_on_top = round(share, 3), agrees)]
+stopifnot(all(crosscheck$agrees))
+```
+
+Every sample's top hit is its expected suffix, typically with ~90% of hits. The rest are chance
+barcode collisions with other libraries. This is why a join on the 16-nt barcode alone would be
+wrong:
+
+```{r}
+#| label: naive-join
+cores_per_lib <- tcr_core[, .(n_libs = .N), by = core]
+gex[cores_per_lib, n_libs_with_core := i.n_libs, on = "core"]
+gex[is.na(n_libs_with_core), n_libs_with_core := 0L]
+gex[, tcr_barcode := paste0(core, "-", sfx)]
+gex[, has_tcr := tcr_barcode %in% contigs$barcode]
+
+gex[, .(
+  gex_cells               = .N,
+  naive_match_core_only   = sum(n_libs_with_core > 0),
+  core_in_multiple_libs   = sum(n_libs_with_core > 1),
+  naive_false_matches     = sum(n_libs_with_core > 0 & !has_tcr),
+  correct_match           = sum(has_tcr)
+), by = stage]
+```
+
+### Join and report match rates
+
+Collapse contigs to one row per cell before joining.
+
+```{r}
+#| label: tcr-per-cell
+stopifnot(contigs[, uniqueN(raw_clonotype_id), by = barcode][, all(V1 == 1)])
+tcr_cells <- contigs[, .(
+  tcr_clonotype = raw_clonotype_id[1],
+  tcr_n_TRA     = sum(chain == "TRA"),
+  tcr_n_TRB     = sum(chain == "TRB"),
+  tcr_TRA_cdr3  = paste(cdr3[chain == "TRA"], collapse = ";"),
+  tcr_TRB_cdr3  = paste(cdr3[chain == "TRB"], collapse = ";")
+), by = .(tcr_barcode = barcode)]
+```
+
+**Share of GEX cells with a TCR**, by sample:
+
+```{r}
+#| label: match-gex
+by_sample <- gex[, .(gex_cells = .N, with_tcr = sum(has_tcr),
+                     pct = round(100 * mean(has_tcr), 1)), by = .(stage, origin, sfx)][order(sfx)]
+by_sample
+gex[, .(gex_cells = .N, with_tcr = sum(has_tcr), pct = round(100 * mean(has_tcr), 1)), by = stage]
+gex[, .(gex_cells = .N, with_tcr = sum(has_tcr), pct = round(100 * mean(has_tcr), 1))]
+```
+
+**Share of TCR cells found in the count matrices**, by library. TCR cells without a GEX match
+were probably removed by the authors' GEX quality filtering.
+
+```{r}
+#| label: match-tcr
+tcr_cells[, in_gex := tcr_barcode %in% gex$tcr_barcode]
+tcr_cells[, sfx := as.integer(sub("^.*-", "", tcr_barcode))]
+tcr_side <- tcr_cells[, .(tcr_cells = .N, in_gex = sum(in_gex),
+                          pct = round(100 * mean(in_gex), 1)), by = sfx
+                    ][lib_map[, .(sfx, origin)], on = "sfx"][order(sfx)]
+tcr_side
+tcr_cells[, .(tcr_cells = .N, in_gex = sum(in_gex), pct = round(100 * mean(in_gex), 1))]
+```
+
+### Attach TCR data to the Seurat objects
+
+```{r}
+#| label: tcr-attach
+add_tcr <- function(obj) {
+  m <- tcr_cells[gex[match(colnames(obj), cell), .(cell, tcr_barcode, tcr_library = origin)],
+                 on = "tcr_barcode"]
+  stopifnot(identical(m$cell, colnames(obj)))
+  m <- as.data.frame(m[, .(tcr_barcode, tcr_library, has_tcr = !is.na(tcr_clonotype),
+                           tcr_clonotype, tcr_n_TRA, tcr_n_TRB, tcr_TRA_cdr3, tcr_TRB_cdr3)])
+  rownames(m) <- colnames(obj)
+  AddMetaData(obj, m)
+}
+pre  <- add_tcr(pre)
+post <- add_tcr(post)
+
+table(pre$has_tcr)
+table(post$has_tcr)
+```
+
+```{r}
+#| label: tcr-cleanup
+rm(contigs, tcr_core, hits, top_hit, crosscheck, cores_per_lib, tcr_cells, gex, gex_cells,
+   lib_map, by_sample, tcr_side, add_tcr, post_check, post_parts, post_prefix, pre_prefix,
+   raw_genes, check_barcodes)
+invisible(gc())
+```
+
+### TCR matching summary
+
+- **Mapping:** the 30 aggregation suffixes map one-to-one to libraries (1–23 post-infusion, 24–30
+  pre-infusion). The barcode-overlap check agrees with the metadata for every GEX sample.
+- **`028-d04-nonT`:** its barcodes land on suffix 7 (`034-d05-CART`). That confirms the metadata
+  (P034, d05) is right and the barcode prefix is wrong.
+- **Match rate:** 68,728 of 78,848 GEX cells (87.2%) have a TCR: pre-infusion 90.4%
+  (21,392 / 23,663) and post-infusion 85.8% (47,336 / 55,185). In the other direction, 93.8% of
+  TCR cells (68,728 / 73,250) are found in the count matrices.
+- **Joining on barcode alone would be wrong:** it would add 926 false matches (203 pre, 723 post),
+  where a cell's barcode exists only in another sample's TCR library.
+- **Low-match libraries:** `116-d21` (14.3%; only 147 TCR cells for 920 GEX cells), `039-d10`
+  (55.7%) and `116-d28` (58.8%). In the first two, almost all TCR cells are in the GEX data,
+  so the TCR library itself captured fewer cells. This isn't a joining problem.
+  `049-d05-CART` (suffix 16, 2 cells) has no GEX counterpart.
+
+### Save TCR-annotated objects (before QC)
+
+```{r}
+#| label: save-tcr
+#| cache: false
+saveRDS(pre,  file.path(proc_dir, "seurat_pre_infusion.rds"))
+saveRDS(post, file.path(proc_dir, "seurat_post_infusion.rds"))
+```
+
+## Quality control
+
+The GEO matrices are already filtered by the authors. Post-infusion cells all have >500 UMIs and
+<10% mitochondrial reads. Pre-infusion has no cell below 683 UMIs but allows up to 25% mito.
+The two stages also differ a lot in depth: the median is ~13k UMIs per cell pre-infusion vs
+~4k post-infusion. So QC here is a light second pass:
+
+- **Low UMIs / low genes:** more than 3 MADs below the sample's median, on a log scale. The cutoff
+  is computed per sample because depth varies so much between samples. Samples with <100 cells
+  are pooled within their stage.
+- **High mito:** a fixed 10% cap in both stages, matching the authors' post-infusion filter.
+  Per-sample 3-MAD mito cutoffs land at ~4.5–9.7% and would remove ~3,300 cells. That is
+  stricter than the authors and penalises activated T cells, which naturally carry more
+  mitochondrial RNA.
+- **No ADT counts:** cells with no surface-protein data at all. These are the 25 `028-d04-nonT`
+  cells.
+- **Doublets:** scDblFinder, run per sample (samples with ≥100 cells only).
+
+### QC metrics
+
+```{r}
+#| label: qc-metrics
+library(scater)
+library(patchwork)
+library(scDblFinder)
+
+add_qc <- function(obj) {
+  obj[["percent.mt"]]   <- PercentageFeatureSet(obj, pattern = "^MT-",       assay = "RNA")
+  obj[["percent.ribo"]] <- PercentageFeatureSet(obj, pattern = "^RP[SL][0-9]", assay = "RNA")
+  iso <- c("IgG1", "IgG2a", "IgG2b")
+  adt <- LayerData(obj, assay = "ADT", layer = "counts")
+  obj$adt_isotype_counts <- colSums(adt[iso, , drop = FALSE])
+  obj$adt_isotype_frac   <- obj$adt_isotype_counts / pmax(obj$nCount_ADT, 1)
+  obj
+}
+pre  <- add_qc(pre)
+post <- add_qc(post)
+
+qc_cols <- c("nCount_RNA", "nFeature_RNA", "percent.mt", "percent.ribo",
+             "nCount_ADT", "nFeature_ADT", "adt_isotype_frac")
+qc_summary <- function(obj) t(sapply(obj[[]][, qc_cols], function(x)
+  round(quantile(x, c(0, 0.01, 0.05, 0.5, 0.95, 0.99, 1)), 2)))
+cat("== PRE\n");  print(qc_summary(pre))
+cat("== POST\n"); print(qc_summary(post))
+```
+
+```{r}
+#| label: qc-per-sample
+per_sample <- function(o) {
+  d <- data.table(sample = o$orig.ident, n_umi = as.numeric(o$nCount_RNA),
+                  n_gene = as.numeric(o$nFeature_RNA), mt = o$percent.mt,
+                  adt = as.numeric(o$nCount_ADT), celltype = o$Final_celltype)
+  d[, .(cells = .N, med_umi = median(n_umi), med_gene = median(n_gene),
+        med_mt = round(median(mt), 2), p99_mt = round(quantile(mt, .99), 1),
+        med_adt = median(adt), pct_undet = round(100 * mean(celltype == "undetermined"), 1)),
+    by = sample][order(sample)]
+}
+cat("== PRE\n");  print(per_sample(pre))
+cat("== POST\n"); print(per_sample(post))
+```
+
+In pre-infusion, the "P"-prefixed samples (P033, P034, P049) have about twice the median mito % of
+the others (~4.4–5.4% vs ~2.2%). Together with the different naming, this suggests two
+processing batches. Pre-infusion patient 116 has 25.5% "undetermined" cells, vs ≤1.2% in the other
+pre-infusion samples (excluding the 4-cell 048 sample).
+
+### QC flags
+
+```{r}
+#| label: qc-flags
+max_mt <- 10
+
+qc_flag <- function(obj, min_cells = 100) {
+  md  <- obj[[]]
+  n   <- table(md$orig.ident)
+  # Tiny samples borrow thresholds from the pooled small samples of the stage
+  grp <- ifelse(n[as.character(md$orig.ident)] < min_cells, "small_pooled",
+                as.character(md$orig.ident))
+  low_umi  <- isOutlier(md$nCount_RNA,   nmads = 3, log = TRUE, type = "lower", batch = grp)
+  low_gene <- isOutlier(md$nFeature_RNA, nmads = 3, log = TRUE, type = "lower", batch = grp)
+  obj$qc_group    <- grp
+  obj$qc_low_umi  <- as.logical(low_umi)
+  obj$qc_low_gene <- as.logical(low_gene)
+  obj$qc_high_mt  <- obj$percent.mt > max_mt
+  obj$qc_no_adt   <- obj$nCount_ADT == 0
+  thr <- data.table(group    = names(attr(low_umi, "thresholds")["lower", ]),
+                    min_umi  = round(attr(low_umi,  "thresholds")["lower", ]),
+                    min_gene = round(attr(low_gene, "thresholds")["lower", ]),
+                    max_mt   = max_mt)
+  list(obj = obj, thresholds = thr)
+}
+
+res <- qc_flag(pre);  pre  <- res$obj; thr_pre  <- res$thresholds
+res <- qc_flag(post); post <- res$obj; thr_post <- res$thresholds
+rm(res); invisible(gc())
+
+flag_cols <- c("qc_low_umi", "qc_low_gene", "qc_high_mt", "qc_no_adt")
+flag_summary <- function(o) {
+  d <- as.data.table(o[[]][, c("orig.ident", flag_cols)])
+  d[, any_flag := qc_low_umi | qc_low_gene | qc_high_mt | qc_no_adt]
+  d[, c(.(cells = .N), lapply(.SD, sum), .(pct_flagged = round(100 * mean(any_flag), 1))),
+    by = orig.ident, .SDcols = c(flag_cols, "any_flag")][order(orig.ident)]
+}
+cat("== PRE thresholds\n");  print(thr_pre)
+cat("== PRE flags\n");       print(flag_summary(pre))
+cat("== POST thresholds\n"); print(thr_post)
+cat("== POST flags\n");      print(flag_summary(post))
+```
+
+```{r}
+#| label: qc-plots
+#| fig-width: 11
+#| fig-height: 7
+qc_theme <- theme_minimal(base_size = 10) +
+  theme(panel.grid.major.y = element_blank(), panel.grid.minor = element_blank(),
+        panel.grid.major.x = element_line(colour = "#ebeae6", linewidth = 0.3),
+        plot.title = element_text(face = "bold", colour = "#0b0b0b"),
+        plot.subtitle = element_text(colour = "#52514e"),
+        axis.text = element_text(colour = "#52514e"))
+
+qc_panel <- function(md, cut, col, cut_col, label, log = TRUE) {
+  p <- ggplot(md, aes(x = .data[[col]], y = sample)) +
+    geom_violin(fill = "#d6d5d0", colour = NA, scale = "width", width = 0.85) +
+    geom_boxplot(width = 0.18, outlier.shape = NA, fill = "#fcfcfb",
+                 colour = "#52514e", linewidth = 0.35) +
+    geom_point(data = cut, aes(x = .data[[cut_col]]), shape = "|", size = 5, colour = "#eb6834") +
+    scale_y_discrete(limits = rev) + labs(title = label, x = NULL, y = NULL) + qc_theme
+  if (log) p + scale_x_log10(labels = scales::label_number(scale_cut = scales::cut_short_scale()))
+  else p
+}
+
+qc_plot <- function(obj, thr, title) {
+  md  <- as.data.table(obj[[]])[, .(sample = orig.ident, qc_group,
+                                    umi = as.numeric(nCount_RNA), gene = as.numeric(nFeature_RNA),
+                                    mt = percent.mt)]
+  cut <- unique(md[, .(sample, qc_group)])[thr, on = c(qc_group = "group"), nomatch = 0]
+  (qc_panel(md, cut, "umi", "min_umi", "UMIs per cell (log)") |
+   qc_panel(md, cut, "gene", "min_gene", "Genes per cell (log)") + theme(axis.text.y = element_blank()) |
+   qc_panel(md, cut, "mt", "max_mt", "Mito %", log = FALSE) + theme(axis.text.y = element_blank())) +
+    plot_annotation(title = title, subtitle = "Orange tick = QC cutoff for that sample",
+                    theme = qc_theme)
+}
+
+qc_plot(pre,  thr_pre,  "Pre-infusion QC")
+qc_plot(post, thr_post, "Post-infusion QC")
+```
+
+### Doublets
+
+```{r}
+#| label: doublets
+run_dbl <- function(obj, min_cells = 100) {
+  n    <- table(obj$orig.ident)
+  keep <- as.character(obj$orig.ident) %in% names(n)[n >= min_cells]
+  sce  <- SingleCellExperiment(list(counts = LayerData(obj, assay = "RNA", layer = "counts")[, keep]))
+  set.seed(1)
+  sce  <- scDblFinder(sce, samples = as.character(obj$orig.ident[keep]),
+                      BPPARAM = BiocParallel::SerialParam())
+  obj$dbl_class <- "not_run"
+  obj$dbl_score <- NA_real_
+  obj$dbl_class[keep] <- as.character(sce$scDblFinder.class)
+  obj$dbl_score[keep] <- sce$scDblFinder.score
+  rm(sce); invisible(gc())
+  obj
+}
+pre  <- run_dbl(pre)
+post <- run_dbl(post)
+
+dbl_summary <- function(o) {
+  d <- as.data.table(o[[]])[, .(sample = orig.ident, dbl_class, multi_TRB = tcr_n_TRB >= 2)]
+  d[, .(cells = .N, doublets = sum(dbl_class == "doublet"),
+        pct_dbl = round(100 * mean(dbl_class == "doublet"), 1),
+        not_run = sum(dbl_class == "not_run")), by = sample][order(sample)]
+}
+cat("== PRE\n");  print(dbl_summary(pre))
+cat("== POST\n"); print(dbl_summary(post))
+```
+
+scDblFinder calls 2–9% of cells doublets per sample. As a check that doesn't depend on the
+expression data, cells with two or more TCR beta chains, a common sign of a doublet, should be
+called doublets much more often:
+
+```{r}
+#| label: doublet-tcr-check
+dbl_vs_trb <- function(o) {
+  d <- as.data.table(o[[]])[has_tcr == TRUE & dbl_class != "not_run",
+                            .(multi_TRB = tcr_n_TRB >= 2, doublet = dbl_class == "doublet")]
+  d[, .(cells = .N, pct_doublet = round(100 * mean(doublet), 1)), by = multi_TRB][order(multi_TRB)]
+}
+cat("== PRE\n");  print(dbl_vs_trb(pre))
+cat("== POST\n"); print(dbl_vs_trb(post))
+```
+
+They are: about 47–49% of multi-TRB cells are called doublets, vs 2–4% of other cells. Multi-TRB
+cells that scDblFinder did not call doublets are kept, since a small share of T cells carry
+two beta chains.
+
+### Filter
+
+```{r}
+#| label: qc-pass
+set_qc_pass <- function(o) {
+  o$qc_pass <- !(o$qc_low_umi | o$qc_low_gene | o$qc_high_mt | o$qc_no_adt) &
+    o$dbl_class != "doublet"
+  o
+}
+pre  <- set_qc_pass(pre)
+post <- set_qc_pass(post)
+
+pass_summary <- function(o) {
+  d <- as.data.table(o[[]])
+  out <- d[, .(cells = .N, kept = sum(qc_pass), removed = sum(!qc_pass),
+               pct_kept = round(100 * mean(qc_pass), 1)), by = orig.ident][order(orig.ident)]
+  rbind(out, d[, .(orig.ident = "TOTAL", cells = .N, kept = sum(qc_pass), removed = sum(!qc_pass),
+                   pct_kept = round(100 * mean(qc_pass), 1))])
+}
+cat("== PRE\n");  print(pass_summary(pre))
+cat("== POST\n"); print(pass_summary(post))
+```
+
+Save every cell's QC flags before dropping any, so the filtering decisions stay on record:
+
+```{r}
+#| label: qc-save-flags
+#| cache: false
+flag_export <- c("orig.ident", "stage", "nCount_RNA", "nFeature_RNA", "percent.mt", "percent.ribo",
+                 "nCount_ADT", "qc_group", "qc_low_umi", "qc_low_gene", "qc_high_mt", "qc_no_adt",
+                 "dbl_class", "dbl_score", "qc_pass")
+qc_flags <- rbind(data.table(cell = colnames(pre),  pre[[]][, flag_export]),
+                  data.table(cell = colnames(post), post[[]][, flag_export]))
+fwrite(qc_flags, file.path(proc_dir, "qc_flags.csv.gz"))
+rm(qc_flags, flag_export); invisible(gc())
+```
+
+```{r}
+#| label: qc-filter
+pre  <- subset(pre,  cells = colnames(pre)[pre$qc_pass])
+post <- subset(post, cells = colnames(post)[post$qc_pass])
+invisible(gc())
+c(pre = ncol(pre), post = ncol(post))
+```
+
+### QC summary
+
+- **Kept:** pre-infusion `r fmt_n(ncol(pre))` of 23,663 cells (`r round(100*ncol(pre)/23663,1)`%), post-infusion `r fmt_n(ncol(post))` of 55,185 (`r round(100*ncol(post)/55185,1)`%).
+  Per sample, 84.7–96.1% is kept, ignoring the 4- and 20-cell samples.
+- **Removed:** all 25 `028-d04-nonT` cells (no ADT data).
+- **Doublet check:** the doublet calls agree with the TCR data (see above).
+- **For later steps:** depth differs ~3× between stages, and pre-infusion looks like it was
+  processed in two batches (P-prefixed samples have higher mito). Both matter for integration.
+
+## Normalize
+
+RNA uses LogNormalize (scale factor 10,000). SCTransform was ruled out to keep memory use
+manageable on a 16 GB machine. ADT uses CLR across each cell's proteins (`margin = 2`), the
+standard Seurat method for antibody counts.
+
+```{r}
+#| label: normalize
+normalize <- function(o) {
+  o <- NormalizeData(o, assay = "RNA", normalization.method = "LogNormalize",
+                     scale.factor = 1e4, verbose = FALSE)
+  o <- NormalizeData(o, assay = "ADT", normalization.method = "CLR", margin = 2, verbose = FALSE)
+  o
+}
+pre  <- normalize(pre)
+post <- normalize(post)
+invisible(gc())
+```
+
+```{r}
+#| label: qc-cleanup
+rm(add_qc, qc_cols, qc_summary, per_sample, qc_flag, flag_cols, flag_summary, thr_pre, thr_post,
+   max_mt, qc_theme, qc_panel, qc_plot, run_dbl, dbl_summary, dbl_vs_trb, set_qc_pass,
+   pass_summary, normalize)
+invisible(gc())
+```
+
+## VDJ QC
+
+The TCR columns attached earlier used every contig. Here they're rebuilt from contigs that pass
+contig-level QC:
+
+- **Contig flags:** `productive`, `full_length`, `high_confidence` and `is_cell` all TRUE.
+- **UMI support:** at least 2 UMIs per contig (3 for a noisy run; see the check below).
+- **Chain counts:** up to 2 TRA is normal (weak allelic exclusion). A cell with more than 1 TRB,
+  or more than 2 TRA, is flagged as a likely doublet (`tcr_multichain`). Its chains are kept, and
+  each cell's top-UMI TRA and TRB are stored separately (`tcr_TRA1_*`, `tcr_TRB1_*`).
+- **Barcode matching:** only cells that passed GEX QC are kept (`pre` and `post` are already
+  filtered).
+
+```{r}
+#| label: vdj-load
+contigs <- fread(geo_file("All_TCR_Aggregated_filtered_contig_annotations.csv.gz"),
+                 select = c("barcode", "is_cell", "contig_id", "high_confidence", "full_length",
+                            "productive", "chain", "cdr3", "cdr3_nt", "v_gene", "j_gene",
+                            "reads", "umis", "raw_clonotype_id", "origin"))
+cat("contigs:", nrow(contigs), " cells:", uniqueN(contigs$barcode), "\n")
+contigs[, .N, by = .(is_cell, productive, full_length, high_confidence)]
+contigs[, .N, by = chain]
+quantile(contigs$umis, c(0, .01, .05, .1, .25, .5, .75, .9, .99, 1))
+contigs[, .(n = .N, umi1 = round(100 * mean(umis == 1), 1), umi2 = round(100 * mean(umis == 2), 1),
+            umi3plus = round(100 * mean(umis >= 3), 1)), by = chain]
+```
+
+GEO provides only Cell Ranger's *filtered* contig file, so every contig already passes the four
+flags. UMI support is the filter that matters. Only 0.7% of TRB contigs have a single UMI, but
+4.8% of TRA contigs have 1 UMI and 9.3% have 2.
+
+### Is this a noisy run? (2 vs 3 UMIs)
+
+Ambient contigs, mostly from highly expanded clones, usually show up as an *extra* chain in a cell
+(not its top-UMI chain of that type) whose CDR3 belongs to an expanded clone in the same library.
+If 2-UMI contigs show that pattern much like 1-UMI contigs, the 3-UMI cutoff is warranted.
+
+```{r}
+#| label: vdj-ambient-check
+contigs[, umi_rank := frank(-umis, ties.method = "first"), by = .(barcode, chain)]
+contigs[, extra_chain := umi_rank > 1]
+
+# Expanded CDR3s: seen as the top chain in >= 10 cells of the same library
+top_cdr3 <- contigs[umi_rank == 1, .(n_cells = uniqueN(barcode)), by = .(origin, chain, cdr3_nt)]
+expanded <- top_cdr3[n_cells >= 10, .(origin, chain, cdr3_nt)]
+contigs[, from_expanded := FALSE]
+contigs[expanded, from_expanded := TRUE, on = .(origin, chain, cdr3_nt)]
+
+contigs[, umi_bin := fcase(umis == 1, "1", umis == 2, "2", umis == 3, "3", umis <= 5, "4-5", default = "6+")]
+amb <- contigs[, .(contigs = .N,
+                   pct_extra_chain        = round(100 * mean(extra_chain), 1),
+                   pct_expanded_cdr3      = round(100 * mean(from_expanded), 1),
+                   pct_extra_and_expanded = round(100 * mean(extra_chain & from_expanded), 1)),
+               by = .(chain, umi_bin)][order(chain, umi_bin)]
+amb
+rm(top_cdr3, expanded); invisible(gc())
+```
+
+It isn't noisy. Extra chains from expanded clones are ≤2.3% of contigs in every UMI bin, and
+2-UMI contigs aren't meaningfully worse than 3-UMI ones (TRA 2.3% vs 1.6%; TRB 0.5% vs 0.5%).
+So we use the standard 2-UMI cutoff. Most low-UMI contigs are the cell's *only* chain of that
+type, so the filter mainly costs some cells their TRA rather than removing ambient chains.
+
+### Filter contigs and rebuild per-cell TCR columns
+
+```{r}
+#| label: vdj-filter
+min_umi <- 2
+n_before <- nrow(contigs)
+vdj <- contigs[is_cell & productive & full_length & high_confidence & umis >= min_umi]
+cat("contigs kept:", nrow(vdj), "of", n_before, sprintf("(%.1f%%)", 100 * nrow(vdj) / n_before), "\n")
+contigs[umis < min_umi, .N, by = chain]
+rm(contigs); invisible(gc())
+```
+
+```{r}
+#| label: vdj-per-cell
+setorder(vdj, barcode, chain, -umis)
+vdj_cells <- vdj[, .(
+  tcr_n_TRA      = sum(chain == "TRA"),
+  tcr_n_TRB      = sum(chain == "TRB"),
+  tcr_TRA_cdr3   = paste(cdr3[chain == "TRA"], collapse = ";"),   # ordered by UMI, high to low
+  tcr_TRB_cdr3   = paste(cdr3[chain == "TRB"], collapse = ";"),
+  tcr_TRA_umis   = paste(umis[chain == "TRA"], collapse = ";"),
+  tcr_TRB_umis   = paste(umis[chain == "TRB"], collapse = ";"),
+  tcr_TRA1_nt    = cdr3_nt[chain == "TRA"][1],                    # top-UMI chain of each type
+  tcr_TRB1_nt    = cdr3_nt[chain == "TRB"][1],
+  tcr_TRA1_v     = v_gene[chain == "TRA"][1],
+  tcr_TRB1_v     = v_gene[chain == "TRB"][1],
+  tcr_clonotype_cr = raw_clonotype_id[1]
+), by = .(tcr_barcode = barcode)]
+vdj_cells[tcr_TRA_cdr3 == "", `:=`(tcr_TRA_cdr3 = NA, tcr_TRA_umis = NA)]
+vdj_cells[tcr_TRB_cdr3 == "", `:=`(tcr_TRB_cdr3 = NA, tcr_TRB_umis = NA)]
+vdj_cells[, tcr_multichain := tcr_n_TRB > 1 | tcr_n_TRA > 2]
+rm(vdj); invisible(gc())
+
+vdj_cells[, .N, by = .(tcr_n_TRA, tcr_n_TRB)][order(-N)]
+```
+
+`tcr_clonotype_cr` is Cell Ranger's clonotype, which was built from the *unfiltered* chains. For
+clonotype analyses after this filter, prefer a key built from the kept chains (e.g. donor +
+`tcr_TRB1_nt` + `tcr_TRA1_nt`).
+
+### Attach to GEX-QC cells
+
+```{r}
+#| label: vdj-attach
+old_tcr_cols <- c("has_tcr", "tcr_clonotype", "tcr_n_TRA", "tcr_n_TRB", "tcr_TRA_cdr3", "tcr_TRB_cdr3")
+attach_vdj <- function(obj) {
+  for (col in intersect(old_tcr_cols, colnames(obj[[]]))) obj[[col]] <- NULL
+  m <- vdj_cells[data.table(tcr_barcode = obj$tcr_barcode), on = "tcr_barcode"]
+  stopifnot(identical(m$tcr_barcode, unname(obj$tcr_barcode)))
+  m[, `:=`(tcr_has_TRB = !is.na(tcr_n_TRB) & tcr_n_TRB >= 1,
+           tcr_paired  = !is.na(tcr_n_TRB) & tcr_n_TRB >= 1 & tcr_n_TRA >= 1)]
+  m[is.na(tcr_multichain), tcr_multichain := FALSE]
+  m <- as.data.frame(m[, !"tcr_barcode"])
+  rownames(m) <- colnames(obj)
+  AddMetaData(obj, m)
+}
+pre  <- attach_vdj(pre)
+post <- attach_vdj(post)
+vdj_in_gex <- vdj_cells[, mean(tcr_barcode %in% c(pre$tcr_barcode, post$tcr_barcode))]
+cat(sprintf("VDJ cells kept after GEX QC: %.1f%%\n", 100 * vdj_in_gex))
+rm(attach_vdj, old_tcr_cols, vdj_in_gex); invisible(gc())
+```
+
+### Recovery
+
+Recovery is the share of GEX-QC cells with a productive TRB, and the share with a paired TRA +
+TRB.
+
+```{r}
+#| label: vdj-recovery
+recovery <- function(o, by) {
+  d <- as.data.table(o[[]])
+  d[, .(cells = .N,
+        pct_TRB        = round(100 * mean(tcr_has_TRB), 1),
+        pct_paired     = round(100 * mean(tcr_paired), 1),
+        pct_multichain = round(100 * mean(tcr_multichain), 1)), by = by][order(get(by[1]))]
+}
+cat("== Overall\n");       print(rbind(recovery(pre, "stage"), recovery(post, "stage")))
+cat("== PRE by sample\n");  print(recovery(pre, "orig.ident"))
+cat("== POST by sample\n"); print(recovery(post, "orig.ident"))
+cat("== By cell type\n")
+print(rbind(recovery(pre, c("stage", "Final_celltype")), recovery(post, c("stage", "Final_celltype"))))
+```
+
+"doubleNeg" cells mostly lack a TRB (15–28%). They're probably γδ T cells or non-T cells, not
+αβ T cells, so αβ recovery is reported for CD4 + CD8 cells only:
+
+```{r}
+#| label: vdj-recovery-ab
+ab <- function(o) {
+  d <- as.data.table(o[[]])[Final_celltype %in% c("CD4", "CD8")]
+  d[, .(cells = .N, pct_TRB = round(100 * mean(tcr_has_TRB), 1),
+        pct_paired = round(100 * mean(tcr_paired), 1),
+        pct_multichain = round(100 * mean(tcr_multichain), 1)), by = stage]
+}
+rbind(ab(pre), ab(post))
+```
+
+```{r}
+#| label: vdj-cleanup
+#| cache: false
+fwrite(vdj_cells, file.path(proc_dir, "vdj_cells_qc.csv.gz"))
+rm(vdj_cells, recovery, ab, min_umi, n_before, amb); invisible(gc())
+```
+
+### VDJ QC summary
+
+- **Contigs:** 146,260 of 150,378 kept (97.3%). The 4,118 removed had 1 UMI (3,604 TRA, 514 TRB).
+- **GEX match:** 87.9% of QC'd VDJ cells match a cell that passed GEX QC.
+- **Recovery, all GEX-QC cells:** pre-infusion 91.9% with TRB / 86.0% paired; post-infusion
+  86.9% / 74.9%.
+- **Recovery, αβ T cells (CD4 + CD8):** pre-infusion 95.9% with TRB / 90.3% paired (18,462
+  cells); post-infusion 90.2% / 77.9% (47,698 cells).
+- **Multi-chain flag:** 1.8–2.0% of cells. scDblFinder had already removed about half of the
+  multi-TRB cells.
+- **Weak samples:** `116-d21` (14.4% TRB), `039-d10` (53.5% TRB, 18.0% paired), `116-d28`
+  (58.8% TRB). These match the small TCR libraries noted earlier.
+
+### Caveat: what TCR overlap can and can't tell us
+
+::: {.callout-warning}
+**These products are autologous, and the GEO post-infusion data is (almost) all CAR+ cells.**
+
+- **Autologous:** the CAR-T product is made from the patient's own T cells, so the patient's
+  unengineered T cells can carry the same TCRs as product cells. TCR sequence alone can't
+  separate product-derived cells from the patient's own cells.
+- **Study design:** after infusion, cells were stained with BV421 anti-CD3ε (SK7) and AF647
+  CD19 tetramers. They
+  were then sorted into CAR T cells (CD3+ CAR+) and endogenous T cells (CD3+ CAR−), each run as
+  a separate 10x library (Methods). So the study *did* capture unengineered T cells after
+  infusion.
+- **What's in the GEO processed data:** 20 of 22 post-infusion libraries are labelled as CAR T
+  (`-CART`, `-CAR`, `-carT`). Only two tiny libraries are labelled `nonT`: `028-d04-nonT`
+  (25 cells, removed in QC) and `033-d10-nonT` (20 cells). These are plausibly CD3+CAR− sorts,
+  but that is unconfirmed, and the TCR table labels both as `-CART`. In practice, the processed
+  post-infusion data is CAR+ cells only. The endogenous libraries may be in the raw SRA data.
+- **What follows:** within this data, pre → post clonotype overlap measures how product clones
+  persist and expand. It doesn't identify *which* post-infusion cells came from the product,
+  because essentially all of them did. A post-infusion clone with no pre-infusion match is not
+  evidence of an endogenous origin; it more likely reflects how deeply the product was sampled.
+  An endogenous comparator would need the CD3+CAR− libraries from the raw data.
+- **Contrast with allogeneic products:** there, donor and host repertoires barely overlap, so TCR
+  overlap alone identifies product cells. That reasoning doesn't carry over to this dataset.
+:::
+
+### The CAR and CD3 ADT signals are missing after infusion
+
+Sorted CAR+ cells should show *more* CAR ADT signal, not less. Instead, CAR is almost absent after
+infusion, and so is CD3E.
+
+First, check that the post-infusion ADT labels are correct. Each protein should correlate best
+with its own gene:
+
+```{r}
+#| label: adt-label-check
+adt_rna_pairs <- c(CD4 = "CD4", CD8A = "CD8A", CD5 = "CD5", CD25 = "IL2RA", `PD-1` = "PDCD1",
+                   CD27 = "CD27", CD28 = "CD28", TIGIT = "TIGIT", CD39 = "ENTPD1", CD95 = "FAS",
+                   CXCR3 = "CXCR3", CCR4 = "CCR4", `4-1BB` = "TNFRSF9")
+adt_label_check <- function(o, n = 8000) {
+  set.seed(1); cells <- sample(colnames(o), min(n, ncol(o)))
+  adt <- as.matrix(LayerData(o, assay = "ADT", layer = "data")[, cells])
+  rna <- as.matrix(LayerData(o, assay = "RNA", layer = "data")[adt_rna_pairs, cells])
+  cm  <- cor(t(adt), t(rna), method = "spearman"); cm[is.na(cm)] <- 0
+  data.table(gene = adt_rna_pairs, expected_adt = names(adt_rna_pairs),
+             r_expected = round(cm[cbind(names(adt_rna_pairs), adt_rna_pairs)], 2),
+             best_adt = rownames(cm)[apply(cm, 2, which.max)])
+}
+cat("== PRE\n");  print(adt_label_check(pre))
+cat("== POST\n"); print(adt_label_check(post))
+rm(adt_rna_pairs, adt_label_check); invisible(gc())
+```
+
+They are: in both stages each protein's best-correlated gene is its own. So the low CAR signal
+isn't a labelling shift, even though the protein *order* differs between the two GEO name files.
+
+Next, compare CAR and CD3E with the isotype controls. An antibody in the staining mix always
+leaves some background counts, so a reagent far *below* the isotype controls was most likely
+not in the staining mix, not read out, or completely blocked.
+
+```{r}
+#| label: car-adt-check
+adt_presence <- function(o) {
+  m <- LayerData(o, assay = "ADT", layer = "counts")[c("CD3E", "CAR", "IgG1", "IgG2a", "IgG2b"), ]
+  d <- data.table(sample = o$orig.ident, t(as.matrix(m > 0)))
+  d[, lapply(.SD, function(x) round(100 * mean(x), 1)), by = sample][order(sample)]
+}
+cat("== PRE: % of cells with any counts\n");  print(adt_presence(pre))
+cat("== POST: % of cells with any counts\n"); print(adt_presence(post))
+rm(adt_presence); invisible(gc())
+```
+
+- **After infusion, in every sample:** CD3E and CAR are nonzero in only 0–2.4% of cells, while
+  isotype controls are nonzero in 13–100%. So both are effectively unmeasured.
+- **Before infusion:** CD3E is present in every sample, but CAR only in the P-prefixed samples
+  (P033 and P034 ~100% nonzero, P049 69%). In 031, 039 and 116 it is below the isotype controls
+  too.
+
+The Methods (CITE-seq antibody preparation) explain most of this:
+
+- **CD3E wasn't stained after infusion.** The panel has 31 TotalSeq-C reagents: 28 antibodies
+  plus 3 isotype controls. Residual infusion product was stained with all 31. Patient PBMCs
+  (post-infusion) were stained with 30: anti-CD3ε (UCHT1) was *left out*, because those cells
+  were stained with BV421 anti-CD3ε (SK7) for sorting. The residual CD3E counts after infusion
+  are background.
+- **"CAR" isn't one of the 31 documented reagents.** The GEO matrix has 32 ADT features, so
+  "CAR" is an extra, undocumented feature. Its signal appears only in the pre-infusion
+  P-prefixed batch. What it measures is unknown (possibly a DNA-barcoded CD19 reagent used in
+  some samples only, but that's a guess), so treat it as unusable unless the authors clarify.
+  The CD19 tetramer used for sorting is listed as AF647-labelled, not oligo-barcoded.
+
+**Consequences:**
+
+- **Post-infusion CAR+ status** can't be checked at the protein level. The RNA does measure the
+  CAR transgene, though (`YESCAR`, see *CAR transgene RNA* below).
+- **Drop from the post-infusion ADT assay:** CAR and CD3E, then re-run CLR (below).
+- **Before infusion:** CAR is kept in the assay but shouldn't be used. It's undocumented, and
+  present only in P033/P034/P049. Don't compare it across stages or batches.
+- **A third sign of two pre-infusion batches:** the CAR feature, alongside the naming and mito
+  differences.
+
+### Drop CAR and CD3E from the post-infusion ADT assay
+
+CLR scales each cell by the geometric mean across its proteins, so the two unmeasured features
+are removed before normalizing again. `nCount_ADT` and `nFeature_ADT` are recomputed to match.
+
+```{r}
+#| label: adt-drop-post
+adt_drop_post <- c("CAR", "CD3E")
+post[["ADT"]] <- subset(post[["ADT"]], features = setdiff(rownames(post[["ADT"]]), adt_drop_post))
+
+adt_counts <- LayerData(post, assay = "ADT", layer = "counts")
+post$nCount_ADT   <- colSums(adt_counts)
+post$nFeature_ADT <- colSums(adt_counts > 0)
+rm(adt_counts)
+post <- NormalizeData(post, assay = "ADT", normalization.method = "CLR", margin = 2, verbose = FALSE)
+DefaultAssay(post) <- "RNA"
+
+stopifnot(nrow(post[["ADT"]]) == 30, !any(adt_drop_post %in% rownames(post[["ADT"]])),
+          identical(rownames(LayerData(post, assay = "ADT", layer = "data")),
+                    rownames(LayerData(post, assay = "ADT", layer = "counts"))))
+rm(adt_drop_post); invisible(gc())
+```
+- **"nonT" samples:** two post-infusion samples are named "nonT" (`033-d10-nonT`, 20 cells,
+  kept; `028-d04-nonT`, removed in QC). Their sort gate may differ, so consider excluding them
+  from clonotype analyses.
+
+## Remove non-T contamination
+
+In the first variable-gene pass, monocyte genes (S100A8/9/12, LYZ, CST3, C1QA) and platelet genes
+(PPBP, PF4, GP9) topped the post-infusion list. Sorted CD3+ cells shouldn't express them, so the
+cells carrying them are measured and removed here.
+
+### Monocyte-like cells
+
+```{r}
+#| label: qc-myeloid
+myeloid_genes <- c("LYZ", "S100A8", "S100A9", "CST3", "FCN1", "CD14")
+tcell_genes   <- c("CD3E", "CD3D", "CD3G", "TRAC", "TRBC1", "TRBC2", "CD2")
+max_myeloid_pct <- 0.2
+
+flag_myeloid <- function(o) {
+  cnt <- LayerData(o, assay = "RNA", layer = "counts")
+  o$myeloid_pct <- 100 * colSums(cnt[myeloid_genes, ]) / o$nCount_RNA
+  o$tcell_pct   <- 100 * colSums(cnt[tcell_genes, ])   / o$nCount_RNA
+  o$qc_myeloid  <- o$myeloid_pct > max_myeloid_pct
+  o
+}
+pre  <- flag_myeloid(pre)
+post <- flag_myeloid(post)
+
+myeloid_summary <- function(o) {
+  d <- as.data.table(o[[]])
+  d[, .(cells = .N, myeloid_flagged = sum(qc_myeloid), pct = round(100 * mean(qc_myeloid), 1),
+        flagged_med_tcell_pct = round(median(tcell_pct[qc_myeloid]), 2),
+        flagged_pct_TRB = round(100 * mean(tcr_has_TRB[qc_myeloid]), 1)), by = orig.ident][order(orig.ident)]
+}
+cat("== PRE\n");  print(myeloid_summary(pre))
+cat("== POST\n"); print(myeloid_summary(post))
+```
+
+Cells above 0.2% monocyte UMIs have a median of **zero** T-cell gene expression (CD3, TRAC, TRBC,
+CD2). Only 12–15% have a TCR, so they are monocytes that got past the sort, not T cells. Many
+carry the authors' "CD4" label, since monocytes express CD4 protein. They're concentrated in
+patients 116 (12–53% of cells), 048 (9–28%), 039 and 031. Patients 033, 034 and 049 have none.
+This explains the low TCR recovery in `116-d21` and `116-d28`. In patient 048, 20–56% of flagged
+cells do have a TCR, so many are probably T-cell/monocyte doublets; they're removed either way.
+
+### Platelet-bound cells
+
+Platelets stuck to T cells are rare, but they put spiky platelet genes into the variable-gene
+list. Cells with ≥5 platelet UMIs are removed (232 post-infusion, 5 pre-infusion).
+
+```{r}
+#| label: qc-platelet
+platelet_genes <- c("PPBP", "PF4", "GP9", "TUBB1", "NRGN", "RGS18", "PTCRA", "CMTM5")
+min_platelet_umi <- 5
+flag_platelet <- function(o) {
+  o$platelet_umi <- colSums(LayerData(o, assay = "RNA", layer = "counts")[platelet_genes, ])
+  o$qc_platelet  <- o$platelet_umi >= min_platelet_umi
+  o
+}
+pre  <- flag_platelet(pre)
+post <- flag_platelet(post)
+rbind(pre = table(pre$qc_platelet), post = table(post$qc_platelet))
+```
+
+```{r}
+#| label: qc-contam-save-flags
+#| cache: false
+qc_flags <- fread(file.path(proc_dir, "qc_flags.csv.gz"))
+contam <- rbind(
+  data.table(cell = colnames(pre),  myeloid_pct = pre$myeloid_pct,  qc_myeloid = pre$qc_myeloid,
+             platelet_umi = pre$platelet_umi,  qc_platelet = pre$qc_platelet),
+  data.table(cell = colnames(post), myeloid_pct = post$myeloid_pct, qc_myeloid = post$qc_myeloid,
+             platelet_umi = post$platelet_umi, qc_platelet = post$qc_platelet))
+qc_flags <- contam[qc_flags, on = "cell"]
+qc_flags[, qc_pass := qc_pass & !fcoalesce(qc_myeloid, FALSE) & !fcoalesce(qc_platelet, FALSE)]
+fwrite(qc_flags, file.path(proc_dir, "qc_flags.csv.gz"))
+rm(qc_flags, contam)
+
+pre  <- subset(pre,  cells = colnames(pre)[!pre$qc_myeloid & !pre$qc_platelet])
+post <- subset(post, cells = colnames(post)[!post$qc_myeloid & !post$qc_platelet])
+rm(flag_myeloid, myeloid_summary, myeloid_genes, tcell_genes, max_myeloid_pct,
+   flag_platelet, platelet_genes, min_platelet_umi); invisible(gc())
+c(pre = ncol(pre), post = ncol(post))
+```
+
+### CAR transgene RNA (`YESCAR`)
+
+The RNA matrix has 33,539 features: the 33,538 genes of 10x's GRCh38 v3.0.0 reference, plus
+`YESCAR` as the last feature. This is presumably the axi-cel (Yescarta) CAR transgene, added to
+the reference. Unlike the ADT data, it gives a direct CAR measurement.
+
+```{r}
+#| label: car-rna
+car_rna <- function(o) {
+  x <- LayerData(o, assay = "RNA", layer = "counts")["YESCAR", ]
+  d <- data.table(sample = o$orig.ident, car = x)
+  rbind(d[, .(cells = .N, pct_pos = round(100 * mean(car > 0), 1), median = median(car),
+              p90 = as.numeric(quantile(car, .9))), by = sample][order(sample)],
+        d[, .(sample = "TOTAL", cells = .N, pct_pos = round(100 * mean(car > 0), 1), median = median(car),
+              p90 = as.numeric(quantile(car, .9)))])
+}
+match("YESCAR", rownames(pre))
+cat("== PRE\n");  print(car_rna(pre))
+cat("== POST\n"); print(car_rna(post))
+rm(car_rna)
+```
+
+- **Pre-infusion:** 48% of cells have CAR RNA (40–64% per sample). That fits a product mixing
+  transduced and untransduced T cells.
+- **Post-infusion:** 56% overall. Detection is limited by dropout: these cells are sequenced ~3×
+  more shallowly and carry fewer CAR transcripts (90th percentile 3 vs 16 UMIs). So zero CAR
+  counts doesn't mean a cell is CAR−. Some samples are lower still: 039 (17–31%) and `116-d21`
+  (10%), possibly from lower CAR expression or some sort impurity.
+- **`033-d10-nonT`:** 0 of 20 cells have CAR RNA, so it's almost certainly an endogenous
+  (CD3+CAR−) sort. It's removed from the CAR-T object:
+
+```{r}
+#| label: drop-nonT
+post <- subset(post, cells = colnames(post)[post$orig.ident != "033-d10-nonT"])
+post$orig.ident <- droplevels(post$orig.ident)
+invisible(gc())
+c(pre = ncol(pre), post = ncol(post))
+```
+
+## Variable genes and PCA
+
+Per stage: 2,000 variable genes (vst), excluding the following, then scaling and 50 PCs.
+
+- **TCR V/J/C segments:** they track clonotype, not cell state.
+- **`MTRNR2L` pseudogenes:** mito-like artefacts.
+- **Hemoglobin genes:** rare red-cell contamination.
+
+`YESCAR` is kept as a variable gene, since CAR expression level is biology of interest.
+
+```{r}
+#| label: hvg-pca
+hvg_exclude_re <- "^TR[ABDG][VJC]|^MTRNR2L|^HB[AB]\\d?$"
+
+hvg_pca <- function(o, n_hvg = 2000, n_pcs = 50) {
+  o <- FindVariableFeatures(o, assay = "RNA", selection.method = "vst", nfeatures = n_hvg + 300,
+                            verbose = FALSE)
+  hvg <- VariableFeatures(o)
+  hvg <- head(hvg[!grepl(hvg_exclude_re, hvg)], n_hvg)
+  VariableFeatures(o) <- hvg
+  o <- ScaleData(o, assay = "RNA", features = hvg, verbose = FALSE)
+  o <- RunPCA(o, assay = "RNA", features = hvg, npcs = n_pcs, verbose = FALSE)
+  o
+}
+pre  <- hvg_pca(pre);  invisible(gc())
+post <- hvg_pca(post); invisible(gc())
+cat("PRE top 25 HVGs: ",  paste(head(VariableFeatures(pre), 25),  collapse = ", "), "\n")
+cat("POST top 25 HVGs:", paste(head(VariableFeatures(post), 25), collapse = ", "), "\n")
+```
+
+Pre-infusion's top variable genes are cytokines and chemokines (IL17F, CSF2, IFNG, IL5, IL13, CCL3/4),
+as expected for an activated product. Post-infusion's are proliferation genes (histones, MKI67, TOP2A,
+UBE2C).
+
+### How much do sample and patient drive the PCs?
+
+```{r}
+#| label: pc-batch-r2
+pc_r2 <- function(o, vars, n = 10) {
+  pcs <- Embeddings(o, "pca")[, 1:n]
+  md  <- o[[]]
+  r2  <- sapply(vars, function(v) apply(pcs, 2, function(p) summary(lm(p ~ factor(md[[v]])))$r.squared))
+  data.table(PC = 1:n, var_explained = round(100 * (Stdev(o, "pca")[1:n]^2) / sum(Stdev(o, "pca")^2), 1),
+             round(r2, 2))
+}
+pre$pre_batch <- ifelse(grepl("^P", as.character(pre$orig.ident)), "P-batch", "other")
+cat("== PRE: R^2 of each PC vs sample / batch / cell type\n")
+print(pc_r2(pre,  c("orig.ident", "pre_batch", "Final_celltype")))
+cat("== POST: R^2 of each PC vs sample / patient / day / cell type\n")
+print(pc_r2(post, c("orig.ident", "patient", "time", "Final_celltype")))
+```
+
+PC1 is largely independent of sample in both stages (R² ≤ 0.24). Several of the following PCs
+are dominated by sample and patient: pre-infusion PC2 (R² 0.67 with sample), and post-infusion PCs 3–6
+(R² 0.46–0.70 with sample, 0.23–0.62 with patient). So clustering needs integration.
+
+## Integration (Harmony by patient)
+
+Harmony on the first 30 PCs, correcting for **patient**, not sample. Patient-level correction
+removes differences between patients but keeps day-to-day changes within each patient, which is
+the post-infusion biology of interest. In pre-infusion, patient also covers the P-vs-other
+processing batch, since the two overlap completely.
+
+```{r}
+#| label: harmony
+library(harmony)
+n_dims <- 30
+set.seed(1)
+pre  <- RunHarmony(pre,  group.by.vars = "patient", reduction.use = "pca", dims.use = 1:n_dims,
+                   reduction.save = "harmony", verbose = FALSE)
+set.seed(1)
+post <- RunHarmony(post, group.by.vars = "patient", reduction.use = "pca", dims.use = 1:n_dims,
+                   reduction.save = "harmony", verbose = FALSE)
+invisible(gc())
+
+emb_r2 <- function(o, red, vars, n = 10) {
+  e  <- Embeddings(o, red)[, 1:n]
+  md <- o[[]]
+  data.table(dim = 1:n, round(sapply(vars, function(v)
+    apply(e, 2, function(p) summary(lm(p ~ factor(md[[v]])))$r.squared)), 2))
+}
+cat("== PRE  patient R^2, PCA vs Harmony\n")
+print(cbind(emb_r2(pre, "pca", "patient"), harmony = emb_r2(pre, "harmony", "patient")$patient))
+cat("== POST patient & day R^2, PCA vs Harmony\n")
+p1 <- emb_r2(post, "pca", c("patient", "time")); p2 <- emb_r2(post, "harmony", c("patient", "time"))
+print(data.table(dim = 1:10, pca_patient = p1$patient, harmony_patient = p2$patient,
+                 pca_day = p1$time, harmony_day = p2$time))
+rm(p1, p2); invisible(gc())
+```
+
+- **Patient effect removed:** patient R² falls from up to 0.67 to ≤0.18 (pre-infusion) and from
+  up to 0.62 to ≤0.09 (post-infusion).
+- **Day effect partly kept:** R² for day falls from 0.12–0.37 to 0.11–0.22 on post-infusion
+  dimensions 2–6. Some loss is expected, because days aren't sampled evenly across patients.
+
+## Clustering and UMAP
+
+```{r}
+#| label: cluster
+resolutions <- c(0.3, 0.5, 0.8, 1.0)
+cluster_umap <- function(o) {
+  o <- FindNeighbors(o, reduction = "harmony", dims = 1:n_dims, verbose = FALSE)
+  o <- FindClusters(o, resolution = resolutions, verbose = FALSE)
+  o <- RunUMAP(o, reduction = "harmony", dims = 1:n_dims, reduction.name = "umap", verbose = FALSE)
+  o
+}
+pre  <- cluster_umap(pre);  invisible(gc())
+post <- cluster_umap(post); invisible(gc())
+n_clusters <- function(o) sapply(paste0("RNA_snn_res.", resolutions), function(r) nlevels(o[[r, drop = TRUE]]))
+rbind(pre = n_clusters(pre), post = n_clusters(post))
+```
+
+### Remove non-T clusters
+
+Clusters where few cells have a TCR or express CD3 are non-T cells. TCR + CD3 + CAR RNA per
+cluster:
+
+```{r}
+#| label: cluster-tcell-check
+cluster_tcell_stats <- function(o, res = "RNA_snn_res.0.5") {
+  cnt <- LayerData(o, assay = "RNA", layer = "counts")
+  d <- data.table(cluster = o[[res, drop = TRUE]], has_TRB = o$tcr_has_TRB,
+                  cd3 = colSums(cnt[c("CD3E", "CD3D", "CD3G"), ]) > 0, car = cnt["YESCAR", ] > 0)
+  d[, .(cells = .N, pct_TRB = round(100 * mean(has_TRB), 1), pct_CD3 = round(100 * mean(cd3), 1),
+        pct_CAR_rna = round(100 * mean(car), 1)), by = cluster][order(cluster)]
+}
+ct_pre  <- cluster_tcell_stats(pre);  print(ct_pre)
+ct_post <- cluster_tcell_stats(post); print(ct_post)
+
+nonT_pre  <- ct_pre[pct_TRB < 25 & pct_CD3 < 50, as.character(cluster)]
+nonT_post <- ct_post[pct_TRB < 25 & pct_CD3 < 50, as.character(cluster)]
+cat("non-T clusters: pre", nonT_pre, "| post", nonT_post, "\n")
+n_nonT_pre  <- sum(as.character(pre$RNA_snn_res.0.5)  %in% nonT_pre)
+n_nonT_post <- sum(as.character(post$RNA_snn_res.0.5) %in% nonT_post)
+```
+
+```{r}
+#| label: nonT-cluster-markers
+top_markers <- function(o, cl, res = "RNA_snn_res.0.5", n = 15) {
+  Idents(o) <- res
+  m <- FindMarkers(o, ident.1 = cl, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.5,
+                   max.cells.per.ident = 1500, verbose = FALSE)
+  m <- m[order(-m$avg_log2FC), ]
+  m <- head(m[m$p_val_adj < 0.01, ], n)
+  paste0(rownames(m), " (", round(m$avg_log2FC, 1), ")", collapse = ", ")
+}
+for (cl in nonT_pre)  cat("PRE  cluster", cl, ":", top_markers(pre,  cl), "\n")
+for (cl in nonT_post) cat("POST cluster", cl, ":", top_markers(post, cl), "\n")
+```
+
+- **Pre-infusion (`r n_nonT_pre` cells):** dendritic-cell and macrophage genes (CCL19, CCL22, IDO1, HCK,
+  MS4A7). 9% have a TCR, 22% express CD3, 4% have CAR RNA.
+- **Post-infusion (`r n_nonT_post` cells):** NK-cell genes (KLRF1, NCR1, SH2D1B, TYROBP, FCER1G; TRDC RNA is
+  also expressed in NK cells). 4% have a TCR, 44% express CD3, and 3% have CAR RNA vs 56%
+  overall. So these are NK cells that got through the sort, *not* NK-like CAR T cells.
+
+```{r}
+#| label: drop-nonT-clusters
+#| cache: false
+cat("non-T clusters -- pre:", if (length(nonT_pre)) nonT_pre else "none",
+    "| post:", if (length(nonT_post)) nonT_post else "none", "\n")
+pre$qc_nonT_cluster  <- as.character(pre$RNA_snn_res.0.5)  %in% nonT_pre
+post$qc_nonT_cluster <- as.character(post$RNA_snn_res.0.5) %in% nonT_post
+
+qc_flags <- fread(file.path(proc_dir, "qc_flags.csv.gz"))
+nt <- rbind(data.table(cell = colnames(pre),  qc_nonT_cluster = pre$qc_nonT_cluster),
+            data.table(cell = colnames(post), qc_nonT_cluster = post$qc_nonT_cluster))
+qc_flags <- nt[qc_flags, on = "cell"]
+qc_flags[orig.ident == "033-d10-nonT", qc_pass := FALSE]
+qc_flags[, qc_pass := qc_pass & !fcoalesce(qc_nonT_cluster, FALSE)]
+fwrite(qc_flags, file.path(proc_dir, "qc_flags.csv.gz"))
+rm(list = intersect(c("qc_flags","nt","ct_pre","ct_post","nonT_pre","nonT_post","cl"), ls()))
+
+pre  <- subset(pre,  cells = colnames(pre)[!pre$qc_nonT_cluster])
+post <- subset(post, cells = colnames(post)[!post$qc_nonT_cluster])
+invisible(gc())
+```
+
+Then rebuild the embedding without them: variable genes → PCA → Harmony → clusters → UMAP.
+
+```{r}
+#| label: rerun-embedding
+rerun <- function(o) {
+  o <- hvg_pca(o)
+  set.seed(1)
+  o <- RunHarmony(o, group.by.vars = "patient", reduction.use = "pca", dims.use = 1:n_dims,
+                  reduction.save = "harmony", verbose = FALSE)
+  cluster_umap(o)
+}
+pre  <- rerun(pre);  invisible(gc())
+post <- rerun(post); invisible(gc())
+rbind(pre = n_clusters(pre), post = n_clusters(post))
+c(pre = ncol(pre), post = ncol(post))
+```
+
+The cell counts (`r fmt_n(ncol(pre))` pre, `r fmt_n(ncol(post))` post) match the `qc_pass` totals in `qc_flags.csv.gz`.
+
+### Final cluster checks
+
+```{r}
+#| label: cluster-tcell-check-final
+cluster_tcell_stats <- function(o, res = "RNA_snn_res.0.5") {
+  cnt <- LayerData(o, assay = "RNA", layer = "counts")
+  d <- data.table(cluster = o[[res, drop = TRUE]], patient = o$patientShort, has_TRB = o$tcr_has_TRB,
+                  cd3 = colSums(cnt[c("CD3E", "CD3D", "CD3G"), ]) > 0, car = cnt["YESCAR", ] > 0)
+  d[, .(cells = .N, pct_TRB = round(100 * mean(has_TRB), 1), pct_CD3 = round(100 * mean(cd3), 1),
+        pct_CAR_rna = round(100 * mean(car), 1),
+        top_patient_pct = round(100 * max(table(patient)) / .N, 1)), by = cluster][order(cluster)]
+}
+cat("== PRE\n");  print(cluster_tcell_stats(pre))
+cat("== POST\n"); print(cluster_tcell_stats(post))
+```
+
+Two clusters stand out:
+
+- **Pre-infusion cluster 8 (337 cells): γδ T and NK cells, kept.** 77% express TRDC and 27% TRGV9;
+  NK genes (KIR2DL4, KLRF1, NCR1, NCAM1, FCGR3A) are common. Only 2% have a TCRβ and 5% have
+  CAR RNA. The infusion product wasn't CAR-sorted, so these untransduced cells are a genuine
+  part of the product. They're kept and labelled at annotation, unlike the post-infusion NK
+  cells, which got through a CD3+CAR+ sort.
+- **Post-infusion cluster 6 (1,583 cells): likely low quality, flagged (`flag_lowq_cluster`).** Its top
+  markers are long, general-purpose genes (ATXN1, CREBBP, RICTOR, KLF12, ARID1B). Compared with
+  other cells, it has half the UMIs (median 2,195 vs 3,980), about twice the mito % (5.3 vs 2.8)
+  and lower TCRβ (49%) and CAR RNA (33%) detection. Removal is to be decided at annotation.
+
+```{r}
+#| label: cluster-qc-checks
+gd_nk_check <- function(o, cl) {
+  cells <- colnames(o)[o$RNA_snn_res.0.5 == cl]
+  rest  <- setdiff(colnames(o), cells)
+  cnt <- LayerData(o, assay = "RNA", layer = "counts")
+  pos <- function(g, cc) round(100 * mean(colSums(cnt[intersect(g, rownames(cnt)), cc, drop = FALSE]) > 0), 1)
+  genes <- list(TRDC = "TRDC", `TRGC1/2` = c("TRGC1", "TRGC2"), TRGV9 = "TRGV9", TRAC = "TRAC",
+                `KLRF1/NCR1` = c("KLRF1", "NCR1"), YESCAR = "YESCAR")
+  data.table(marker = names(genes), cluster = sapply(genes, pos, cells), rest = sapply(genes, pos, rest))
+}
+cat("== PRE cluster 8\n"); print(gd_nk_check(pre, "8"))
+cat("PRE cluster 8 markers:", top_markers(pre, "8", n = 12), "\n")
+
+cat("POST cluster 6 markers:", top_markers(post, "6", n = 12), "\n")
+as.data.table(post[[]])[, .(cl6 = RNA_snn_res.0.5 == "6", nCount_RNA, nFeature_RNA, percent.mt,
+                            percent.ribo, dbl_score)][, lapply(.SD, function(x) round(median(x, na.rm = TRUE), 3)), by = cl6]
+
+post$flag_lowq_cluster <- post$RNA_snn_res.0.5 == "6"
+rm(gd_nk_check)
+```
+
+### Overview
+
+```{r}
+#| label: umap-plots
+#| fig-width: 12
+#| fig-height: 9
+pal8 <- c("#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#6250d6", "#e34948")
+ct_cols <- c(CD4 = "#2a78d6", CD8 = "#eb6834", doubleNeg = "#1baf7a", doublePos = "#6250d6",
+             undetermined = "#b8b7b1")
+umap_theme <- theme_minimal(base_size = 10) +
+  theme(panel.grid = element_blank(), axis.text = element_blank(), axis.title = element_text(colour = "#52514e"),
+        plot.title = element_text(face = "bold", colour = "#0b0b0b"), legend.title = element_blank())
+
+overview_plot <- function(o, title, res = "RNA_snn_res.0.5") {
+  d <- data.table(Embeddings(o, "umap"), cluster = o[[res, drop = TRUE]], celltype = o$Final_celltype,
+                  patient = o$patientShort)
+  setnames(d, 1:2, c("u1", "u2"))
+  d <- d[sample(.N)]
+  lab <- d[, .(u1 = median(u1), u2 = median(u2)), by = cluster]
+  p1 <- ggplot(d, aes(u1, u2)) +
+    geom_point(aes(colour = cluster), size = 0.05, alpha = 0.6, show.legend = FALSE) +
+    scale_colour_manual(values = rep(pal8, length.out = nlevels(d$cluster))) +
+    geom_label(data = lab, aes(label = cluster), size = 3, linewidth = 0, fill = "#fcfcfb", alpha = 0.85) +
+    labs(title = "Clusters (res 0.5)", x = "UMAP 1", y = "UMAP 2") + umap_theme
+  p2 <- ggplot(d, aes(u1, u2, colour = celltype)) + geom_point(size = 0.05, alpha = 0.6) +
+    scale_colour_manual(values = ct_cols) + guides(colour = guide_legend(override.aes = list(size = 3, alpha = 1))) +
+    labs(title = "Authors' cell type (ADT-based)", x = "UMAP 1", y = "UMAP 2") + umap_theme
+  comp <- d[, .N, by = .(cluster, patient)][, share := N / sum(N), by = cluster]
+  p3 <- ggplot(comp, aes(x = cluster, y = share, fill = patient)) +
+    geom_col(width = 0.8, colour = "#fcfcfb", linewidth = 0.3) +
+    scale_fill_manual(values = pal8) + scale_y_continuous(labels = scales::percent) +
+    labs(title = "Patient mix per cluster", x = "Cluster", y = NULL) +
+    theme_minimal(base_size = 10) + theme(panel.grid.major.x = element_blank(), panel.grid.minor = element_blank(),
+                                          plot.title = element_text(face = "bold"), legend.title = element_blank())
+  (p1 | p2) / p3 + plot_layout(heights = c(2, 1)) +
+    plot_annotation(title = title, theme = theme(plot.title = element_text(face = "bold", size = 13)))
+}
+overview_plot(pre,  "Pre-infusion (Harmony by patient)")
+overview_plot(post, "Post-infusion (Harmony by patient)")
+```
+
+- **Pre-infusion:** clusters are well mixed across patients. Cluster 9 (204 cells) is 66% P07.
+- **Post-infusion:** CD4 cells sit apart from CD8. Cluster 7 (1,173 cells) is 83% P05 (patient 039).
+  It's polyclonal T cells (top clone <1% in the earlier check), so it's a patient-specific state
+  rather than one expanded clone, and Harmony doesn't merge it.
+
+```{r}
+#| label: embedding-cleanup
+#| cache: false
+rm(hvg_pca, pc_r2, emb_r2, rerun, cluster_umap, hvg_exclude_re, resolutions, n_clusters, n_dims)
+invisible(gc())
+saveRDS(pre,  file.path(proc_dir, "seurat_pre_infusion_clustered.rds"))
+saveRDS(post, file.path(proc_dir, "seurat_post_infusion_clustered.rds"))
+```
+
+### Drop the low-quality post-infusion cluster
+
+Post-infusion cluster 6 is removed. The existing embedding and cluster numbers are kept rather
+than rebuilt, since it's 3.4% of cells and a rebuild would renumber every cluster.
+
+```{r}
+#| label: drop-lowq-cluster
+#| cache: false
+qc_flags <- fread(file.path(proc_dir, "qc_flags.csv.gz"))
+qc_flags[, qc_lowq_cluster := cell %in% colnames(post)[post$flag_lowq_cluster]]
+qc_flags[qc_lowq_cluster == TRUE, qc_pass := FALSE]
+fwrite(qc_flags, file.path(proc_dir, "qc_flags.csv.gz"))
+cat("cells passing all QC: pre", qc_flags[stage == "Pre", sum(qc_pass)], "| post", qc_flags[stage == "Post", sum(qc_pass)], "\n")
+rm(qc_flags)
+
+post <- subset(post, cells = colnames(post)[!post$flag_lowq_cluster])
+post$flag_lowq_cluster <- NULL
+for (r in grep("^RNA_snn_res", colnames(post[[]]), value = TRUE)) post[[r]] <- droplevels(post[[r, drop = TRUE]])
+rm(r); invisible(gc())
+c(post_cells = ncol(post), post_clusters_res0.5 = nlevels(post$RNA_snn_res.0.5))
+```
+
+## Annotation
+
+Clusters at resolution 0.5 are annotated from four sources:
+
+- **Surface proteins (ADT):** mean CLR per cluster, z-scored across clusters.
+- **Canonical T-cell genes:** % of cells expressing each.
+- **Cell-cycle phase.**
+- **Unbiased markers:** `FindAllMarkers`, top 10 per cluster.
+
+Clonal expansion is the share of TCRβ+ cells in clones of ≥5 cells, with clones defined
+per patient by the top TRB CDR3 nucleotide sequence.
+
+```{r}
+#| label: annot-profile
+adt_panel <- c("CD4", "CD8A", "CD45RA", "CD45RO", "CCR7", "CD27", "CD28", "CD95", "CD127", "CD25",
+               "PD-1", "TIM-3", "LAG-3", "TIGIT", "CD39", "CD57", "CXCR3", "CCR4", "CCR6", "4-1BB", "OX40", "TCRgd")
+rna_panel <- c("SELL", "TCF7", "LEF1", "IL7R", "GZMK", "GZMB", "PRF1", "GNLY", "NKG7", "FOXP3", "IL2RA",
+               "MKI67", "TOP2A", "HAVCR2", "LAG3", "TOX", "ENTPD1", "KLRB1", "ZNF683", "CX3CR1", "KLRG1",
+               "IFNG", "CSF2", "IL17A", "TRDC", "KLRF1", "YESCAR")
+
+cluster_profile <- function(o, res = "RNA_snn_res.0.5") {
+  cl  <- o[[res, drop = TRUE]]
+  adt <- LayerData(o, assay = "ADT", layer = "data")
+  adt_mean <- sapply(intersect(adt_panel, rownames(adt)), function(p) tapply(adt[p, ], cl, mean))
+  adt_z    <- round(scale(adt_mean), 1)
+  rna <- LayerData(o, assay = "RNA", layer = "counts")[rna_panel, ]
+  rna_pct  <- round(sapply(rna_panel, function(g) tapply(rna[g, ] > 0, cl, mean)) * 100)
+  clone <- ifelse(o$tcr_has_TRB, paste(o$patient, o$tcr_TRB1_nt), NA)
+  csize <- table(clone)
+  big   <- !is.na(clone) & as.vector(csize[clone]) >= 5
+  extra <- data.table(cluster = levels(cl), cells = as.vector(table(cl)),
+                      pct_CD4_lab  = as.vector(round(100 * tapply(o$Final_celltype == "CD4", cl, mean))),
+                      pct_CD8_lab  = as.vector(round(100 * tapply(o$Final_celltype == "CD8", cl, mean))),
+                      pct_expanded = as.vector(round(100 * tapply(big[!is.na(clone)], cl[!is.na(clone)], mean))))
+  list(extra = extra, adt_z = adt_z, rna_pct = rna_pct)
+}
+prof_pre  <- cluster_profile(pre)
+prof_post <- cluster_profile(post)
+prof_pre
+prof_post
+```
+
+```{r}
+#| label: annot-markers
+pre  <- CellCycleScoring(pre,  s.features = cc.genes.updated.2019$s.genes,
+                         g2m.features = cc.genes.updated.2019$g2m.genes, set.ident = FALSE)
+post <- CellCycleScoring(post, s.features = cc.genes.updated.2019$s.genes,
+                         g2m.features = cc.genes.updated.2019$g2m.genes, set.ident = FALSE)
+phase_tab <- function(o) round(100 * prop.table(table(cluster = o$RNA_snn_res.0.5, o$Phase), 1))
+cat("== PRE phase % by cluster\n");  print(phase_tab(pre))
+cat("== POST phase % by cluster\n"); print(phase_tab(post))
+
+all_markers <- function(o, res = "RNA_snn_res.0.5", n = 10) {
+  Idents(o) <- res
+  m <- FindAllMarkers(o, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.5,
+                      max.cells.per.ident = 500, verbose = FALSE)
+  m <- as.data.table(m)[p_val_adj < 0.01][order(cluster, -avg_log2FC)]
+  m[, .(top = paste(head(gene, n), collapse = ", ")), by = cluster]
+}
+mk_pre  <- all_markers(pre);  mk_pre
+mk_post <- all_markers(post); mk_post
+```
+
+Post-infusion phase scores put ~30% of cells in S phase in almost every cluster, likely an artefact
+of shallow sequencing. Only clusters 4 and 8 are truly cycling (MKI67/TOP2A).
+
+### Labels
+
+| Pre-infusion cluster | Label | Key evidence |
+|---|---|---|
+| 0 | Prolif G2/M | 82% G2/M; UBE2C, TOP2A, PLK1 |
+| 1 | CD8 Tc2-like (GATA3+ PTGDR2+) | GATA3, PTGDR2 (CRTH2), IL9R, IL3RA; CD45RO+ PD-1+ CXCR3+ |
+| 2 | Activated prolif S (CD25hi CD30+) | IL2RA in 96%; TNFRSF8 (CD30), BCAT1, PYCR1; 63% S phase |
+| 3 | Prolif S (CD8-rich) | 84% S phase; E2F1, MCM2/5, GINS2 |
+| 4 | CD4 memory (CCR6+ KLRB1+) | CD4, CCR6, KLRB1, CTLA4, OX40, IL6R; FOXP3 RNA in 42% |
+| 5 | TCF7+ CCR7+ memory (CD4/CD8) | TCF7, LEF1, CCR7, SELL, PLAC8; CD27hi CD28+ |
+| 6 | CD8 effector (GZMH+ KLRG1+) | GZMH, GZMK, KLRG1, FGFBP2, EOMES; CD57+; 66% in expanded clones |
+| 7 | Prolif G2/M late (CCNB1+ CDC20+) | 66% G2/M; CCNB1/2, CDC20, PTTG1 |
+| 8 | γδ T / NK (non-CAR) | TRDC, KIR2DL4, KLRF1, NCR1; 2% TCRβ, 5% CAR RNA |
+| 9 | Prolif histone-hi (P07-enriched)? | Histone genes; 78% G2/M; 66% P07 |
+
+| Post-infusion cluster | Label | Key evidence |
+|---|---|---|
+| 0 | CD8 TEMRA (CX3CR1+ S1PR5+) | S1PR5, CX3CR1, FGFBP2, ADGRG1; CD45RA+ CD57+ CD28− |
+| 1 | CD8 TEM GZMK+ (CXCR3+ SELL+) | GZMK in 90%, CXCR3, SELL |
+| 2 | CD4 memory (IL7R+ KLRB1+) | CD4, CD40LG, IL7R, KLRB1, GPR183; CCR6+ OX40+ |
+| 3 | CD8 GZMK+ activated (NR4A2+ RGS1+) | GZMK, NR4A2, RGS1, PIM3, DUSP4, NFKBIA |
+| 4 | Prolif S | 86% S phase; MCM10, CDC45, TYMS |
+| 5 | CD4 naive-like/TCM (CCR7+ TCF7+) | CCR7, TCF7 76%, LEF1, IL7R 91%; no clonal expansion |
+| 7 | CD8 CD39hi (patient 039-specific) | CD39 ADT highest; MPZL3, EXTL3, DUSP4; 83% patient 039, polyclonal |
+| 8 | Prolif G2/M | 58% G2/M; CDC20, BIRC5, MKI67 |
+| 9 | CD4 Treg (FOXP3+ IKZF2+) | FOXP3, IL2RA, IKZF2, RTKN2; CD25hi CCR4+ |
+| 10 | Interferon-stimulated (ISG-hi) | IFIT1/3, RSAD2, MX1, ISG15 |
+| 11 | CD8 activated/exhausted-like (4-1BB+ LAG-3+ TIM-3+) | TNFRSF9, LAG3 92%, HAVCR2, TIGIT, CCL3/4; TIM-3 and 4-1BB ADT highest |
+| 12 | CD8 PD-1+ TOX+ TCF7+ (TPEX-like)? | PD-1, TIGIT, LAG-3, CD27, CD28 ADT highest; TOX 61%, TCF7 51%; 271 cells, 54% P07 |
+
+"?" marks tentative labels.
+
+```{r}
+#| label: annotate
+annot_pre <- c(
+  `0` = "Prolif G2/M",
+  `1` = "CD8 Tc2-like (GATA3+ PTGDR2+)",
+  `2` = "Activated prolif S (CD25hi CD30+)",
+  `3` = "Prolif S (CD8-rich)",
+  `4` = "CD4 memory (CCR6+ KLRB1+)",
+  `5` = "TCF7+ CCR7+ memory (CD4/CD8)",
+  `6` = "CD8 effector (GZMH+ KLRG1+)",
+  `7` = "Prolif G2/M late (CCNB1+ CDC20+)",
+  `8` = "γδ T / NK (non-CAR)",
+  `9` = "Prolif histone-hi (P07-enriched)?")
+lineage_pre <- c(`0` = "Proliferating", `1` = "CD8", `2` = "Proliferating", `3` = "Proliferating",
+                 `4` = "CD4", `5` = "CD4/CD8", `6` = "CD8", `7` = "Proliferating",
+                 `8` = "γδ T / NK", `9` = "Proliferating")
+annot_post <- c(
+  `0`  = "CD8 TEMRA (CX3CR1+ S1PR5+)",
+  `1`  = "CD8 TEM GZMK+ (CXCR3+ SELL+)",
+  `2`  = "CD4 memory (IL7R+ KLRB1+)",
+  `3`  = "CD8 GZMK+ activated (NR4A2+ RGS1+)",
+  `4`  = "Prolif S",
+  `5`  = "CD4 naive-like/TCM (CCR7+ TCF7+)",
+  `7`  = "CD8 CD39hi (patient 039-specific)",
+  `8`  = "Prolif G2/M",
+  `9`  = "CD4 Treg (FOXP3+ IKZF2+)",
+  `10` = "Interferon-stimulated (ISG-hi)",
+  `11` = "CD8 activated/exhausted-like (4-1BB+ LAG-3+ TIM-3+)",
+  `12` = "CD8 PD-1+ TOX+ TCF7+ (TPEX-like)?")
+lineage_post <- c(`0` = "CD8", `1` = "CD8", `2` = "CD4", `3` = "CD8", `4` = "Proliferating", `5` = "CD4",
+                  `7` = "CD8", `8` = "Proliferating", `9` = "CD4", `10` = "CD8", `11` = "CD8", `12` = "CD8")
+
+apply_annot <- function(o, annot, lineage) {
+  cl <- as.character(o$RNA_snn_res.0.5)
+  stopifnot(setequal(unique(cl), names(annot)))
+  o$annot   <- factor(unname(annot[cl]), levels = unname(annot))
+  o$lineage <- factor(unname(lineage[cl]))
+  o
+}
+pre  <- apply_annot(pre,  annot_pre,  lineage_pre)
+post <- apply_annot(post, annot_post, lineage_post)
+```
+
+```{r}
+#| label: annot-plots
+#| fig-width: 9
+#| fig-height: 8
+dot_genes <- c("CD4", "CD8A", "CCR7", "TCF7", "SELL", "IL7R", "KLRB1", "FOXP3", "IL2RA", "GZMK", "CXCR3",
+               "NR4A2", "GZMH", "GZMB", "CX3CR1", "KLRG1", "PDCD1", "TOX", "LAG3", "HAVCR2", "TNFRSF9",
+               "ENTPD1", "GATA3", "PTGDR2", "IFIT1", "MKI67", "TOP2A", "TRDC", "KLRF1", "YESCAR")
+annot_umap <- function(o, title) {
+  d <- data.table(Embeddings(o, "umap"), annot = o$annot)
+  setnames(d, 1:2, c("u1", "u2"))
+  d <- d[sample(.N)]
+  lab <- d[, .(u1 = median(u1), u2 = median(u2)), by = annot]
+  lab[, short := sub(" \\(.*", "", annot)]
+  ggplot(d, aes(u1, u2)) +
+    geom_point(aes(colour = annot), size = 0.08, alpha = 0.5, show.legend = FALSE) +
+    scale_colour_manual(values = rep(pal8, length.out = nlevels(d$annot))) +
+    ggrepel::geom_label_repel(data = lab, aes(label = short), size = 3, linewidth = 0, fill = "#fcfcfb",
+                              alpha = 0.9, min.segment.length = 0, box.padding = 0.4, seed = 1) +
+    labs(title = title, x = "UMAP 1", y = "UMAP 2") + umap_theme + theme(aspect.ratio = 1)
+}
+annot_dots <- function(o, title) {
+  DotPlot(o, features = intersect(dot_genes, rownames(o)), group.by = "annot", assay = "RNA") +
+    scale_colour_gradient(low = "#e8eef8", high = "#1c4f8f", name = "Avg expr\n(scaled)") +
+    scale_size(range = c(0, 5), name = "% cells") +
+    labs(title = title, x = NULL, y = NULL) +
+    theme_minimal(base_size = 10) +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5), panel.grid.minor = element_blank(),
+          plot.title = element_text(face = "bold"))
+}
+annot_umap(pre,  "Pre-infusion product")
+annot_umap(post, "Post-infusion CAR T cells")
+```
+
+```{r}
+#| label: annot-dots
+#| fig-width: 13
+#| fig-height: 6
+annot_dots(pre,  "Pre-infusion: marker genes by annotation")
+annot_dots(post, "Post-infusion: marker genes by annotation")
+```
+
+```{r}
+#| label: annot-cleanup
+rm(prof_pre, prof_post, mk_pre, mk_post, phase_tab, cluster_profile, all_markers, apply_annot,
+   annot_pre, annot_post, lineage_pre, lineage_post, adt_panel, rna_panel)
+invisible(gc())
+```
+
+## Clone tracking
+
+Track each infusion-product clone into the post-infusion timepoints.
+
+**Two design points set before any testing.**
+
+*Patient IDs differ between stages* (`031` pre vs `P031` post). `patientShort` (P01–P07) is present
+in both and verified consistent, so it is the join key. Joining on `patient` would silently
+return zero overlap.
+
+*The product frequency is itself an estimate.* Each product frequency comes from ~2–4k sampled
+cells, so a binomial test treating it as known is anticonservative. We use the exact conditional
+(Fisher) test, which conditions on both margins and so propagates sampling error in the product
+as well as the timepoint. The naive binomial is computed alongside for comparison.
+
+Clone = patient + top-UMI TRB CDR3 nucleotide sequence. Denominators are TRB+ cells only.
+Patient P06 is excluded: its product yielded 3 cells, so no frequency is estimable.
+
+::: {.callout-important}
+**Selection, not just sampling, can make a product clone absent post-infusion.** The product is
+unsorted and contains untransduced T cells; post-infusion is CAR+ sorted. A clone that was never
+transduced cannot appear post-infusion, and would be misread as contraction.
+
+This is not hypothetical here. CAR RNA detection is strongly state-dependent, and the CD8
+effector (GZMH+ KLRG1+) cluster — the clonally expanded compartment of the product — retains
+about half the CAR detection of other cells even after matching on sequencing depth
+(logistic coefficient −1.44 on cluster membership, with depth in the model). Contraction calls
+for effector-phenotype clones are therefore confounded with transduction status, and the
+per-clone product CAR fraction (`prod_car_frac`) is carried through so this can be inspected.
+:::
+
+```{r}
+#| label: clone-setup
+clone_cells <- function(o, stage) {
+  cnt <- LayerData(o, assay = "RNA", layer = "counts")
+  data.table(cell = colnames(o), stage = stage, pt = as.character(o$patientShort),
+             time = if (stage == "pre") "product" else as.character(o$time),
+             clone = fifelse(o$tcr_has_TRB, paste0(o$patientShort, "|", o$tcr_TRB1_nt), NA_character_),
+             annot = as.character(o$annot), car = as.numeric(cnt["YESCAR", ] > 0))[!is.na(clone)]
+}
+cc <- rbind(clone_cells(pre, "pre"), clone_cells(post, "post"))
+
+prod_n  <- cc[stage == "pre", .(prod_total = .N), by = pt]
+drop_pt <- prod_n[prod_total < 100, pt]
+cc <- cc[!pt %in% drop_pt]
+
+prod <- cc[stage == "pre", .(prod_count = .N, prod_car_frac = mean(car)), by = .(pt, clone)]
+prod[prod_n, prod_total := i.prod_total, on = "pt"]
+prod[, prod_freq := prod_count / prod_total]
+
+post_tp <- cc[stage == "post", .(obs = .N), by = .(pt, time, clone)]
+tp_n    <- cc[stage == "post", .(tp_total = .N), by = .(pt, time)]
+
+grid <- prod[, .(pt, clone, prod_count, prod_freq, prod_total, prod_car_frac)][
+  tp_n, on = "pt", allow.cartesian = TRUE]
+grid[post_tp, obs := i.obs, on = .(pt, time, clone)]
+grid[is.na(obs), obs := 0L]
+grid[, expected := prod_freq * tp_total]
+```
+
+Before testing, confirm the product→post overlap behaves as sampling predicts rather than
+indicating a join bug:
+
+```{r}
+#| label: clone-overlap-check
+found <- grid[, .(ever_found = as.integer(any(obs > 0))), by = .(pt, clone, prod_count)]
+found[, .(clones = .N, pct_ever_found = round(100 * mean(ever_found), 1)),
+      by = .(size = cut(prod_count, c(0, 1, 2, 4, 9, 19, Inf),
+                        labels = c("1", "2", "3-4", "5-9", "10-19", "20+")))][order(size)]
+```
+
+Overlap rises from 2.1% for singleton product clones to 98% for clones of ≥20 cells, which is the
+expected sampling behaviour: most product clones are seen once in ~3,000 cells and simply are not
+re-sampled. This is the user-flagged depth problem, quantified.
+
+```{r}
+#| label: clone-test
+a <- grid$prod_count; b <- grid$obs
+m <- a + b
+n <- (grid$prod_total + grid$tp_total) - m
+k <- grid$tp_total
+grid[, p_contract := phyper(b, m, n, k)]
+grid[, p_expand   := phyper(b - 1L, m, n, k, lower.tail = FALSE)]
+grid[, p_two      := pmin(1, 2 * pmin(p_contract, p_expand))]
+grid[, fdr        := p.adjust(p_two, "BH")]
+
+# Absence is informative only if a stable clone would have been seen:
+# P(obs = 0 | stable) ~ exp(-expected), so expected >= 3 gives <= 5% chance of a false zero.
+grid[, contraction_powered := expected >= 3]
+grid[, call := fcase(
+  fdr < 0.05 & obs > expected,                       "expanding",
+  fdr < 0.05 & obs < expected & contraction_powered, "contracting",
+  fdr >= 0.05 & contraction_powered,                 "stable",
+  default = "underpowered")]
+
+grid[, p_binom := pmin(1, 2 * pmin(pbinom(obs, tp_total, prod_freq),
+                                   pbinom(obs - 1L, tp_total, prod_freq, lower.tail = FALSE)))]
+grid[, fdr_binom := p.adjust(p_binom, "BH")]
+
+grid[, .N, by = call][order(-N)]
+data.table(test = c("exact conditional", "naive binomial"),
+           n_sig = c(sum(grid$fdr < 0.05), sum(grid$fdr_binom < 0.05)))
+```
+
+The naive binomial returns 148 significant calls against 90 for the exact conditional — 64% more,
+the anticonservatism predicted above. A concrete case: a singleton product clone observed 14 times
+at a timepoint looks like a 13-fold expansion, but with one product cell the frequency is
+compatible with a range that includes the observed count, and the conditional test returns
+FDR 0.50. The naive test calls it significant.
+
+```{r}
+#| label: clone-test-filtered
+# Independent filtering: restrict to clones whose product frequency is estimable (>=2 product
+# cells). This uses ONLY the product sample, so it cannot bias the post-infusion comparison.
+g2 <- grid[prod_count >= 2]
+g2[, fdr_f := p.adjust(p_two, "BH")]
+g2[, call_f := fcase(
+  fdr_f < 0.05 & obs > expected,                       "expanding",
+  fdr_f < 0.05 & obs < expected & contraction_powered, "contracting",
+  fdr_f >= 0.05 & contraction_powered,                 "stable",
+  default = "underpowered")]
+g2[, .N, by = call_f][order(-N)]
+```
+
+**Result: 98% of clone × timepoint tests are underpowered.** In the filtered universe (3,371
+tests) there are 105 contracting, 17 expanding and 623 stable calls. Expansion calls are few
+because the conditional test is honest about product-frequency uncertainty, which is where most
+of the apparent signal in a naive analysis comes from.
+
+### Peak versus persistence
+
+Peak = first timepoint in d08–d14; persistence = last in d28–d90. Four patients (P02, P04, P05,
+P07) have both.
+
+```{r}
+#| label: clone-phase
+tp_n[, day := as.integer(sub("^d", "", time))]
+phase <- rbind(
+  tp_n[day <= 14][order(pt, day)][, .SD[1], by = pt][, phase := "peak"],
+  tp_n[day >= 28][order(pt, -day)][, .SD[1], by = pt][, phase := "persistence"])
+both <- phase[, .N, by = pt][N == 2, pt]
+ph <- phase[pt %in% both, .(pt, time, phase, tp_total)]
+
+cl_ph <- prod[pt %in% both, .(pt, clone, prod_count, prod_freq, prod_car_frac)]
+for (p in c("peak", "persistence")) {
+  tt <- ph[phase == p, .(pt, time, tot = tp_total)]
+  oo <- post_tp[tt, on = .(pt, time)][, .(pt, clone, o = obs)]
+  cl_ph[oo, paste0("obs_", p) := i.o, on = .(pt, clone)]
+  cl_ph[tt, paste0("tot_", p) := i.tot, on = "pt"]
+}
+cl_ph[is.na(obs_peak), obs_peak := 0L]; cl_ph[is.na(obs_persistence), obs_persistence := 0L]
+
+A <- cl_ph$obs_peak; B <- cl_ph$obs_persistence
+M <- A + B; N2 <- (cl_ph$tot_peak + cl_ph$tot_persistence) - M; K <- cl_ph$tot_persistence
+cl_ph[, p_shift := pmin(1, 2 * pmin(phyper(B - 1L, M, N2, K, lower.tail = FALSE),
+                                    phyper(B, M, N2, K)))]
+cl_ph[, fdr_shift := p.adjust(p_shift, "BH")]
+cl_ph[, f_peak := obs_peak / tot_peak][, f_pers := obs_persistence / tot_persistence]
+cl_ph[, phase_class := fcase(fdr_shift < 0.05 & f_peak > f_pers, "peak-dominant",
+                             fdr_shift < 0.05 & f_pers > f_peak, "persistence-dominant",
+                             default = "no shift")]
+dcast(cl_ph[, .N, by = .(pt, phase_class)], pt ~ phase_class, value.var = "N", fill = 0)
+```
+
+Only 9 clones shift significantly across all four patients. The reason is depth: persistence
+timepoints have 360–1,178 cells.
+
+```{r}
+#| label: phase-power
+cl_ph[, exp_peak := prod_freq * tot_peak][, exp_pers := prod_freq * tot_persistence]
+cl_ph[, .(clones = .N,
+          measurable_at_peak = sum(exp_peak >= 3),
+          measurable_at_persistence = sum(exp_pers >= 3),
+          measurable_at_BOTH = sum(exp_peak >= 3 & exp_pers >= 3)), by = pt][order(pt)]
+```
+
+**Only 5–26 clones per patient (45 total) are jointly measurable at both phases.**
+
+### Testing the "different precursors" claim
+
+The claim is that peak-dominant and persistence-dominant clones arise from different product
+precursors. Rather than a low-powered binary split, we test it continuously: among jointly
+measurable clones, does a clone's persistence-vs-peak bias relate to its product phenotype?
+Patient is included as a covariate, because the clone sets are patient-specific.
+
+```{r}
+#| label: precursor-test
+jm <- cl_ph[exp_peak >= 3 & exp_pers >= 3]
+eps <- 0.5
+jm[, pers_bias := log2(((obs_persistence + eps) / tot_persistence) / ((obs_peak + eps) / tot_peak))]
+prod_phen <- cc[stage == "pre", .(f_mem = mean(annot == "TCF7+ CCR7+ memory (CD4/CD8)"),
+                                  f_eff = mean(annot == "CD8 effector (GZMH+ KLRG1+)"),
+                                  f_prolif = mean(grepl("^Prolif|^Activated prolif", annot)),
+                                  f_car = mean(car)), by = .(pt, clone)]
+jm <- prod_phen[jm, on = .(pt, clone)]
+
+# Clones unobserved at BOTH phases carry no bias information; they sit at the pseudocount centre.
+jm2 <- jm[obs_peak + obs_persistence > 0]
+n_jm_shallow <- nrow(jm)   # used inline in the prose below
+range(jm$f_mem)   # degenerate: these large clones have essentially no memory-cluster cells
+
+jm2[, .(n = .N, rho_f_eff = round(cor(f_eff, pers_bias, method = "spearman"), 3)), by = pt][order(pt)]
+c(pooled_rho_f_eff = round(cor(jm2$f_eff, jm2$pers_bias, method = "spearman"), 3),
+  median_within_patient_rho = round(median(jm2[, cor(f_eff, pers_bias, method = "spearman"), by = pt]$V1), 3))
+
+for (v in c("f_eff", "f_prolif", "f_car")) {
+  fit <- summary(lm(reformulate(c(v, "pt"), "pers_bias"), data = jm2))
+  cat(sprintf("%-9s beta=%7.3f  se=%6.3f  p=%.3f\n", v, coef(fit)[2,1], coef(fit)[2,2], coef(fit)[2,4]))
+}
+```
+
+On this timepoint selection the claim does not reproduce: the pooled Spearman between product
+effector fraction and persistence bias is 0.368, but the median *within-patient* correlation is
+0.039 (Simpson's paradox), and with patient in the model no product phenotype predicts
+persistence bias (f_eff p = 0.98, f_prolif p = 0.94, f_car p = 0.19). `f_mem` is degenerate —
+the jointly measurable (large) product clones have essentially no memory-cluster cells.
+
+**However, this result is partly an artefact of the timepoint rule above, which cost more power
+than the data itself did.** See the next section.
+
+### Revisiting: timepoint choice, not data depth, was the binding constraint
+
+Two choices above were wasteful. Clone counting was restricted to GEX-QC cells, when it only
+needs a productive TRB (the TCR libraries hold 7–38% more cells). And "persistence" took the
+*latest* timepoint, when it should take the *deepest valid* one: for P02 that meant d90
+(631 TCR cells) instead of d28 (5,609) — a 9× loss. The peak rule had the same flaw, selecting
+near-empty d05 libraries (P49 peak = 1 cell).
+
+Re-selecting the **deepest library within each window** (peak d08–d14, persistence ≥d28), and
+counting from the TCR libraries directly:
+
+```{r}
+#| label: power-recoverable
+ct <- fread(geo_file("All_TCR_Aggregated_filtered_contig_annotations.csv.gz"),
+            select = c("barcode", "origin", "chain", "cdr3_nt", "umis", "donor", "Meta:time"))
+setnames(ct, "Meta:time", "time")
+tb <- ct[chain == "TRB" & umis >= 2][order(barcode, -umis)][, .SD[1], by = barcode]
+tb[, pt := paste0("P", donor)][, clone := paste0(pt, "|", cdr3_nt)]
+
+prodT <- tb[time == "d00", .(prod_count = .N), by = .(pt, clone)]
+prodT[tb[time == "d00", .(prod_total = .N), by = pt], prod_total := i.prod_total, on = "pt"]
+prodT[, prod_freq := prod_count / prod_total]
+postT <- tb[time != "d00"]
+tpT   <- postT[, .(tot = .N), by = .(pt, time)][, day := as.integer(sub("d", "", time))]
+
+pick2 <- rbind(
+  tpT[day >= 8 & day <= 14][order(pt, -tot)][, .SD[1], by = pt][, phase := "peak"],
+  tpT[day >= 28][order(pt, -tot)][, .SD[1], by = pt][, phase := "persistence"])
+pick2[order(pt, phase)]
+
+# jointly measurable clones under this (deepest-library) selection
+both2 <- pick2[, .N, by = pt][N == 2, pt]
+res2  <- prodT[pt %in% both2]
+cnt2  <- postT[pt %in% both2, .N, by = .(pt, time, clone)]
+for (ph2 in c("peak", "persistence")) {
+  sl <- pick2[phase == ph2 & pt %in% both2, .(pt, time, tot)]
+  res2[cnt2[sl, on = .(pt, time)], paste0("obs_", ph2) := i.N, on = .(pt, clone)]
+  res2[sl, paste0("tot_", ph2) := i.tot, on = "pt"]
+}
+res2[is.na(obs_peak), obs_peak := 0L]; res2[is.na(obs_persistence), obs_persistence := 0L]
+n_jm_deep <- res2[prod_freq * tot_peak >= 3 & prod_freq * tot_persistence >= 3, .N]
+n_jm_deep
+```
+
+This more than doubles the jointly measurable set, to **`r n_jm_deep` clones** (from `r n_jm_shallow`); P49 alone goes from
+0 to 67 once both of its timepoints are deep.
+
+Re-testing the claim on that set (43 clones with product phenotype, 4 patients) **changes the
+answer**:
+
+| Predictor | Previous (45-clone set) | Deepest-timepoint set |
+|---|---|---|
+| f_eff (product effector fraction) | p = 0.98, within-patient rho 0.039 | p = 0.119, within-patient rho **0.228** |
+| f_prolif | p = 0.94 | p = 0.649 |
+| f_car (product CAR fraction) | p = 0.19 | beta = −4.85, **p = 0.001** |
+
+So there *is* a signal: clones with lower product CAR fraction are more persistence-biased, and
+effector-phenotype product clones trend toward persistence bias — the opposite direction to the
+usual "memory precursors persist" expectation.
+
+::: {.callout-warning}
+**Do not read the `f_car` result as biology yet.** Product CAR detection is confounded with cell
+state and depth (see the earlier callout): low-CAR product cells are enriched in the CD8 effector
+cluster, so `f_car` and `f_eff` are negatively correlated and point the same way here. The
+association is equally consistent with (a) genuine biology — lower CAR expression means less
+tonic signalling and better persistence, which is established CAR-T biology — and (b) the
+effector-phenotype signal re-expressed through a confounded proxy. These cannot be separated
+with this data.
+:::
+
+**Why more sequencing would not settle it.** The limiting factor is not depth. Among well-measured
+clones, 90% in P02 and 86% in P06 are absent at *both* post-infusion phases. Those clones are
+uninformative about phase bias, and their absence is confounded with transduction status, since
+the product is unsorted and post-infusion is CAR+ sorted. Deeper sequencing of the same libraries
+would not change that — it is a selection effect, not a sampling one. What would resolve it:
+bulk TCR-seq on the same samples, or the endogenous CD3+CAR− libraries.
+
+## Three-phase trajectory (expansion / persistence 1 / persistence 2)
+
+The two-phase framing above is wrong: the authors use **three** phases. The sampling structure
+makes the intended design obvious — every patient has a d21 timepoint, which the binary analysis
+discarded entirely (20,593 cells, and the *deepest* timepoint for three patients).
+
+Phase definitions are the authors' own (study schematic): **T_exp d8–12, T_per1 d21, T_per2 d28**,
+with the infusion product (IP) as the baseline. Cells were sorted CD3+ CD19-tetramer+.
+
+Two patients were drawn off schedule, and the deposited data has extra samples outside the
+three-phase design:
+
+| Deviation | Handling |
+|---|---|
+| P04 T_per2 drawn d30, not d28 | kept as T_per2 (schedule slippage) |
+| P06 T_exp drawn d14, outside d8–12 | moot — P06 excluded anyway (7 product cells) |
+| P02 d90, P02/P03 d05 | excluded; not part of the three-phase design |
+
+After this, every analysed patient (P01, P02, P04, P05, P07) sits inside the authors' windows.
+
+::: {.callout-note}
+**All 7 patients are complete responders.** There is no responder / non-responder contrast in
+this dataset, so nothing here can link a clone's persistence to clinical outcome — the question
+is only what distinguishes persistent clones *within* responders.
+:::
+
+```{r}
+#| label: three-phase-structure
+ct <- fread(geo_file("All_TCR_Aggregated_filtered_contig_annotations.csv.gz"),
+            select = c("barcode", "chain", "cdr3_nt", "umis", "donor", "Meta:time"))
+setnames(ct, "Meta:time", "time")
+tb <- ct[chain == "TRB" & umis >= 2][order(barcode, -umis)][, .SD[1], by = barcode]
+dmap <- c(`31` = "P04", `33` = "P01", `34` = "P03", `39` = "P05", `48` = "P06", `49` = "P02", `116` = "P07")
+tb[, pt := dmap[as.character(donor)]][, clone := paste0(pt, "|", cdr3_nt)]
+tb[, day := as.integer(sub("d", "", time))]
+dcast(tb[, .N, by = .(pt, day)], pt ~ day, value.var = "N", fill = 0)[order(pt)]
+
+# Authors' windows: T_exp d8-12, T_per1 d21, T_per2 d28 (d30 kept as P04's T_per2).
+tb[, phase := fcase(day == 0, "product", day >= 8 & day <= 14, "expansion",
+                    day == 21, "persistence1", day >= 28 & day <= 30, "persistence2")]
+tbp <- tb[!is.na(phase)]
+# Confirm every analysed patient-day falls in an authors' window
+tbp[phase != "product", sort(unique(day))]
+```
+
+Rather than a single ratio, fit each clone a **trajectory**: weighted least squares of log
+frequency on phase index, using whichever phases are measurable for that clone (expected ≥ 3,
+at least two phases), weighted by observed count. A negative slope means the clone declines
+across the phases; positive means it is maintained or rises.
+
+```{r}
+#| label: trajectory-fit
+prodP <- tbp[phase == "product", .(prod_count = .N), by = .(pt, clone)]
+prodP[tbp[phase == "product", .(prod_total = .N), by = pt], prod_total := i.prod_total, on = "pt"]
+prodP[, prod_freq := prod_count / prod_total]
+keep_pt <- prodP[, .(tot = max(prod_total)), by = pt][tot >= 100, pt]
+tot3 <- tbp[phase != "product", .(tot = .N), by = .(pt, phase)]
+use  <- intersect(keep_pt, tot3[, .N, by = pt][N == 3, pt])
+
+cnt3 <- tbp[phase != "product" & pt %in% use, .N, by = .(pt, phase, clone)]
+gr <- prodP[pt %in% use][tot3[pt %in% use], on = "pt", allow.cartesian = TRUE]
+gr[cnt3, obs := i.N, on = .(pt, phase, clone)]
+gr[is.na(obs), obs := 0L]
+gr[, expected := prod_freq * tot][, pidx := match(phase, c("expansion", "persistence1", "persistence2"))]
+
+gm  <- gr[expected >= 3]
+ok2 <- gm[, .N, by = .(pt, clone)][N >= 2]
+gm  <- gm[ok2[, .(pt, clone)], on = .(pt, clone)]
+gm[, `:=`(y = log((obs + 0.5) / tot), w = obs + 0.5)]
+slopes <- gm[, { f <- lm(y ~ pidx, weights = w)
+                 .(slope = unname(coef(f)[2]), n_phase = .N, tot_obs = sum(obs)) }, by = .(pt, clone)]
+slopes <- prodP[slopes, on = .(pt, clone)]
+slopes[, .(clones = .N, informative = sum(tot_obs > 0)), by = pt][order(pt)]
+```
+
+138 clones get a trajectory across 5 patients; 76 also have a product phenotype.
+
+```{r}
+#| label: trajectory-test
+cnt_pre <- LayerData(pre, assay = "RNA", layer = "counts")
+pp <- data.table(clone = paste0(as.character(pre$patientShort), "|", pre$tcr_TRB1_nt),
+                 has = pre$tcr_has_TRB, annot = as.character(pre$annot),
+                 umi = pre$nCount_RNA, car = as.numeric(cnt_pre["YESCAR", ] > 0))[has == TRUE]
+pp <- pp[, .(n_gex = .N, med_umi = median(umi),
+             f_eff = mean(annot == "CD8 effector (GZMH+ KLRG1+)"),
+             f_mem = mean(annot == "TCF7+ CCR7+ memory (CD4/CD8)"),
+             f_prolif = mean(grepl("^Prolif|^Activated prolif", annot)),
+             f_car = mean(car)), by = clone]
+sl2 <- pp[slopes[tot_obs > 0], on = "clone"][!is.na(f_eff)][, log_umi := log10(med_umi)]
+
+for (v in c("f_eff", "f_mem", "f_prolif", "f_car")) {
+  fit <- summary(lm(reformulate(c(v, "pt"), "slope"), data = sl2))
+  cat(sprintf("%-9s beta=%7.3f  p=%.4f\n", v, coef(fit)[2,1], coef(fit)[2,4]))
+}
+car_fit <- coef(summary(lm(slope ~ f_car + pt, data = sl2)))
+car_beta <- car_fit["f_car", 1]
+car_p <- car_fit["f_car", 4]
+```
+
+### Result
+
+**Product differentiation state does not predict the trajectory.** Effector fraction p = 0.34,
+memory fraction p = 0.22, proliferating fraction p = 0.72. On this data the "different
+precursors" claim does not reproduce when precursor is defined by differentiation phenotype —
+and unlike the two-phase attempt, `f_mem` is now testable rather than degenerate.
+
+**Product CAR expression does predict it, but the result is fragile.** Lower product CAR fraction
+goes with better maintenance (beta = `r sprintf('%.2f', car_beta)`, p = `r sprintf('%.4f', car_p)`), and unlike the earlier effector signal
+this holds *within* patients (median rho −0.42), so it is not Simpson's paradox. It also survives
+adjustment for effector phenotype and product sequencing depth:
+
+```{r}
+#| label: car-confound-adjust
+for (f in list(slope ~ f_car + pt, slope ~ f_car + f_eff + pt, slope ~ f_car + log_umi + pt,
+               slope ~ f_car + f_eff + log_umi + pt)) {
+  co <- coef(summary(lm(f, sl2)))
+  cat(sprintf("%-42s f_car beta=%7.3f  p=%.4f\n", deparse(f), co["f_car",1], co["f_car",4]))
+}
+sl2[, .(clones = .N, median_slope = round(median(slope), 2), pct_rising = round(100 * mean(slope > 0))),
+    by = .(car_bin = cut(f_car, c(-.01, .1, .3, .5, 1)))][order(car_bin)]
+```
+
+There is a clean dose-response — median slope falls 0.69 → 0.49 → 0.13 → 0.10 and the share of
+rising clones falls 94% → 85% → 71% → 58% across increasing product CAR fraction — which argues
+for something real.
+
+## Linking fate to product phenotype
+
+Map fate-classified clones back to their infusion-product cells. Clones are split by trajectory
+slope into **expansion-biased** (bottom tertile, least maintained) and **persistence-biased**
+(top tertile). Note this is a relative gradient, not "expands then vanishes" versus "persists":
+the median slope of the expansion-biased group is −0.16, i.e. nearly flat.
+
+This section is self-contained: it rebuilds clone counts and fate classes from the TCR libraries
+so it does not depend on objects cleaned up earlier.
+
+```{r}
+#| label: fate-rebuild
+ct <- fread(geo_file("All_TCR_Aggregated_filtered_contig_annotations.csv.gz"),
+            select = c("barcode", "chain", "cdr3_nt", "umis", "donor", "Meta:time"))
+setnames(ct, "Meta:time", "time")
+tb <- ct[chain == "TRB" & umis >= 2][order(barcode, -umis)][, .SD[1], by = barcode]
+dmap <- c(`31`="P04", `33`="P01", `34`="P03", `39`="P05", `48`="P06", `49`="P02", `116`="P07")
+tb[, pt := dmap[as.character(donor)]][, clone := paste0(pt, "|", cdr3_nt)][, day := as.integer(sub("d","",time))]
+tb[, phase := fcase(day == 0, "IP", day >= 8 & day <= 14, "T_exp",
+                    day == 21, "T_per1", day >= 28 & day <= 30, "T_per2")]
+tbp <- tb[!is.na(phase)][, phase := factor(phase, levels = c("IP","T_exp","T_per1","T_per2"))]
+
+ptot <- tbp[, .(tot = .N), by = .(pt, phase)]
+use  <- intersect(ptot[, .N, by = pt][N == 4, pt], ptot[phase == "IP" & tot >= 100, pt])
+cnt  <- ptot[tbp[pt %in% use, .N, by = .(pt, phase, clone)], on = .(pt, phase)][, freq := N / tot]
+
+w <- dcast(cnt, pt + clone ~ phase, value.var = "N", fill = 0)
+w <- ptot[phase == "IP", .(pt, tot_IP = tot)][w, on = "pt"][, prod_freq := IP / tot_IP]
+for (p in c("T_exp","T_per1","T_per2")) w[ptot[phase == p], (paste0("tot_", p)) := i.tot, on = "pt"]
+long <- melt(w[, .(pt, clone, prod_freq, T_exp, T_per1, T_per2, tot_T_exp, tot_T_per1, tot_T_per2)],
+             id.vars = c("pt","clone","prod_freq"), measure.vars = patterns("^T_", "^tot_T"),
+             variable.name = "pidx", value.name = c("obs","tot"))
+long[, pidx := as.integer(pidx)][, expected := prod_freq * tot]
+lm2 <- long[expected >= 3]
+lm2 <- lm2[lm2[, .N, by = .(pt, clone)][N >= 2][, .(pt, clone)], on = .(pt, clone)]
+lm2[, `:=`(y = log((obs + 0.5) / tot), ww = obs + 0.5)]
+slopes <- lm2[, { f <- lm(y ~ pidx, weights = ww)
+                  .(slope = unname(coef(f)[2]), tot_obs = sum(obs)) }, by = .(pt, clone)][tot_obs > 0]
+slopes[, fate := fcase(slope <= quantile(slope, 1/3), "Expansion-biased",
+                       slope >= quantile(slope, 2/3), "Persistence-biased", default = "Intermediate")]
+cnt <- slopes[, .(pt, clone, fate)][cnt, on = .(pt, clone)][is.na(fate), fate := "Not tracked"]
+slopes[, .N, by = fate]
+```
+
+```{r}
+#| label: fate-to-cluster
+# Fisher OR per product cluster, cell level. OR > 1 = enriched in persistence-biased clones.
+pc <- data.table(clone = paste0(as.character(pre$patientShort), "|", pre$tcr_TRB1_nt),
+                 has = pre$tcr_has_TRB, annot = as.character(pre$annot),
+                 pt = as.character(pre$patientShort))[has == TRUE][, idx := .I]
+pc <- slopes[, .(clone, fate)][pc, on = "clone"][fate %in% c("Expansion-biased", "Persistence-biased")]
+pc[, fate2 := fifelse(fate == "Persistence-biased", "pers", "exp")]
+
+ors <- rbindlist(lapply(unique(pc$annot), function(cl) {
+  a <- pc[fate2=="pers" & annot==cl, .N]; b <- pc[fate2=="pers" & annot!=cl, .N]
+  cc <- pc[fate2=="exp" & annot==cl, .N]; d <- pc[fate2=="exp" & annot!=cl, .N]
+  ft <- fisher.test(matrix(c(a, b, cc, d), 2, byrow = TRUE))
+  data.table(cluster = cl, n_pers = a, n_exp = cc, OR = unname(ft$estimate),
+             lo = ft$conf.int[1], hi = ft$conf.int[2], p_cell = ft$p.value) }))
+ors[, fdr_cell := p.adjust(p_cell, "BH")]
+ors[order(-OR), .(cluster, n_pers, n_exp, OR = round(OR, 2),
+                  CI = paste0(round(lo,2), "-", round(hi,2)), fdr = signif(fdr_cell, 2))]
+or_eff  <- ors[cluster == "CD8 effector (GZMH+ KLRG1+)", OR]
+fdr_eff <- ors[cluster == "CD8 effector (GZMH+ KLRG1+)", fdr_cell]
+or_tc2  <- ors[cluster == "CD8 Tc2-like (GATA3+ PTGDR2+)", OR]
+fdr_tc2 <- ors[cluster == "CD8 Tc2-like (GATA3+ PTGDR2+)", fdr_cell]
+
+# clone-level test (one observation per clone, patient-adjusted)
+cf <- pc[, .(n = .N), by = .(clone, pt, fate2, annot)]
+tc <- pc[, .(tot = .N), by = .(clone, pt, fate2)]
+cf <- tc[cf, on = .(clone, pt, fate2)][, frac := n / tot]
+fullc <- CJ(clone = tc$clone, annot = unique(pc$annot), unique = TRUE)
+fullc <- tc[fullc, on = "clone"][cf[, .(clone, annot, frac)], on = .(clone, annot)]
+fullc[is.na(frac), frac := 0]
+ors[, p_clone := sapply(cluster, function(cl) {
+  s <- fullc[annot == cl]; if (s[, uniqueN(frac)] < 3) return(NA_real_)
+  coef(summary(lm(frac ~ fate2 + pt, data = s)))["fate2pers", 4] })]
+pclone_eff <- ors[cluster == "CD8 effector (GZMH+ KLRG1+)", p_clone]
+```
+
+Cell-level, the result looks emphatic: CD8 effector (GZMH+ KLRG1+) enriched in persistence-biased
+clones (OR `r sprintf('%.2f', or_eff)`, FDR `r fmt_e(fdr_eff)`) and CD8 Tc2-like (GATA3+ PTGDR2+) strongly depleted
+(OR `r sprintf('%.2f', or_tc2)`, FDR `r fmt_e(fdr_tc2)`).
+
+::: {.callout-important}
+**None of it survives.** Two problems with the cell-level test:
+
+1. **Pseudoreplication.** Cells within a clone are not independent — they are clonal descendants.
+   A cluster's apparent enrichment can come from one or two large clones. The CD8 effector
+   signal rests on 13 expansion-biased versus 23 persistence-biased clones.
+2. **Patient confounding.** Fate class is unbalanced across patients (P04: 1 expansion-biased
+   versus 10 persistence-biased; P02: 5 versus 1), and 61 of the 94 Tc2-like cells come from
+   a single patient.
+
+Re-testing at the clone level (one observation per clone) with patient adjustment:
+
+```{r}
+#| label: cell-vs-clone-level
+#| echo: false
+knitr::kable(
+  ors[n_pers + n_exp >= 20][order(-OR),
+      .(Cluster = cluster, `Cell-level FDR` = fmt_e(fdr_cell),
+        `Clone-level p (patient-adjusted)` = sprintf("%.3f", p_clone))],
+  caption = "Cell-level significance vs the clone-level test that supersedes it.")
+```
+:::
+
+```{r}
+#| label: fate-adjusted
+# Clone-level, patient-adjusted, across product clusters + RNA markers + CITE-seq proteins
+
+eff_g <- c("GZMK","NKG7","KLRG1","GZMH","PRF1"); mem_g <- c("TCF7","CCR7","SELL","LEF1","IL7R")
+prot  <- c("CD45RA","CD45RO","CCR7","CD27","CD28","CD95","CD57")   # CD62L not in the 31-plex panel
+lg <- LayerData(pre, assay = "RNA", layer = "data"); ap <- LayerData(pre, assay = "ADT", layer = "data")
+pcx <- copy(pc)
+for (g in c(eff_g, mem_g)) pcx[, (g) := lg[g, idx]]
+for (q in prot) pcx[, (paste0("prot_", q)) := ap[q, idx]]
+cm <- pcx[, lapply(.SD, mean), by = .(clone, pt, fate2), .SDcols = c(eff_g, mem_g)]
+cp <- pcx[, lapply(.SD, mean), by = .(clone, pt, fate2), .SDcols = paste0("prot_", prot)]
+
+gather <- function(vars, dat, label) rbindlist(lapply(vars, function(v) {
+  co <- coef(summary(lm(reformulate(c("fate2","pt"), v), data = dat)))
+  data.table(domain = label, feature = v, beta_pers = co["fate2pers",1], p = co["fate2pers",4]) }))
+allres <- rbindlist(list(
+  ors[!is.na(p_clone), .(domain = "product cluster", feature = cluster, beta_pers = NA_real_, p = p_clone)],
+  gather(c(eff_g, mem_g), cm, "RNA marker"),
+  gather(paste0("prot_", prot), cp, "CITE-seq protein")))
+allres[, fdr := p.adjust(p, "BH")]
+allres[order(p)][1:10, .(domain, feature, p = signif(p, 3), fdr = signif(fdr, 3))]
+allres[fdr < 0.05, .N]
+```
+
+**Nothing is significant after BH across all 24 tests.** The requested effector-versus-memory
+contrast (GZMK, NKG7, KLRG1 against TCF7, CCR7, SELL) shows no patient-adjusted difference: all
+effector markers trend *lower* in persistence-biased clones (GZMK p = 0.14, others p > 0.33) and
+all memory markers show raw means higher in persistence-biased clones but lose it entirely on
+patient adjustment (TCF7 p = 0.75, CCR7 p = 0.89, SELL p = 0.78) — another between-patient effect.
+
+CITE-seq proteins agree. CD62L is not in the 31-plex panel, so memory state rests on CD45RA,
+CD45RO, CCR7, CD27, CD28, CD95. The only nominal hit is **CD57 lower in persistence-biased clones**
+(beta −0.134, p = 0.021), which is biologically coherent — CD57 marks terminal differentiation —
+but it does not survive correction (FDR 0.49) and is one of seven proteins tested.
+
+::: {.callout-warning}
+**A structural limit, not just a power limit.** The memory clusters are essentially absent from
+fate-classifiable clones: the TCF7+ CCR7+ memory cluster contributes **1 cell** and CD4 memory
+**3 cells**, against hundreds in the effector and proliferating clusters. Clones large enough to
+track reliably are, by construction, the clonally expanded ones — and those are effector and
+proliferating, not memory. So the memory-precursor hypothesis cannot be tested in this design at
+all, whatever the sample size. Testing it needs clone tracking that does not condition on product
+abundance, i.e. bulk TCR-seq.
+:::
+
+### Plots
+
+```{r}
+#| label: plot-alluvial
+#| fig-width: 12
+#| fig-height: 7
+library(ggalluvial)
+topn <- cnt[, .(mx = max(freq)), by = .(pt, clone)][order(pt, -mx)][, head(.SD, 10), by = pt]
+al <- cnt[topn[, .(pt, clone)], on = .(pt, clone)]
+al <- al[CJ(pt = unique(al$pt), clone = unique(al$clone), phase = levels(cnt$phase), unique = TRUE),
+         on = .(pt, clone, phase)][topn[, .(pt, clone)], on = .(pt, clone)]
+al[is.na(freq), freq := 0]
+al[, fate := fate[!is.na(fate)][1], by = .(pt, clone)]
+al[is.na(fate), fate := "Not tracked"]
+al[, fate := factor(fate, levels = c("Expansion-biased", "Intermediate", "Persistence-biased", "Not tracked"))]
+
+fate_cols <- c("Expansion-biased" = "#eb6834", "Intermediate" = "#b8b7b1",
+               "Persistence-biased" = "#2a78d6", "Not tracked" = "#dcdbd6")
+ggplot(al, aes(x = phase, y = freq, alluvium = clone, fill = fate)) +
+  geom_alluvium(aes(group = clone), width = 0.3, alpha = 0.85, decreasing = FALSE,
+                colour = "#fcfcfb", linewidth = 0.2) +
+  facet_wrap(~ pt, nrow = 1, scales = "free_y") +
+  scale_fill_manual(values = fate_cols, name = NULL, drop = FALSE) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  labs(title = "Top 10 clones per patient tracked across phases",
+       subtitle = "Infusion product → expansion (d8–12) → persistence 1 (d21) → persistence 2 (d28)",
+       x = NULL, y = "Clone frequency (of TRB+ cells)") +
+  theme_minimal(base_size = 10) +
+  theme(panel.grid.major.x = element_blank(), panel.grid.minor = element_blank(),
+        panel.grid.major.y = element_line(colour = "#ebeae6", linewidth = 0.3),
+        axis.text.x = element_text(angle = 45, hjust = 1, colour = "#52514e"),
+        plot.title = element_text(face = "bold"), plot.subtitle = element_text(colour = "#52514e"),
+        strip.text = element_text(face = "bold"), legend.position = "bottom")
+```
+
+::: {.callout-important}
+**The alluvial exposes a selection bias in the fate classification.** The pale "Not tracked"
+clones are those with **zero** post-infusion observations at every phase — clones that vanish
+completely. In P02 these include product clones of 43, 29, 19 and 18 cells that are never seen
+again. A trajectory slope cannot be fitted to all zeros, so the `tot_obs > 0` filter silently
+drops them.
+
+The clones with the most dramatic fate are therefore **excluded from the expansion-versus-
+persistence comparison**, and their disappearance is confounded with transduction status (the
+product is unsorted, post-infusion is CAR+ sorted). Any statement about what distinguishes
+persistent clones applies only to clones that survived detectably at all.
+:::
+
+```{r}
+#| label: plot-or
+#| fig-width: 10
+#| fig-height: 5.5
+od <- ors[n_pers + n_exp >= 20][order(OR)]
+od[, cluster := factor(cluster, levels = cluster)]
+od[, dir := fifelse(OR > 1, "Enriched in persistence-biased", "Enriched in expansion-biased")]
+od[, lab := sprintf("cell FDR %s   |   clone-level p = %.2f",
+                    ifelse(fdr_cell < 1e-3, format(fdr_cell, digits = 1, scientific = TRUE),
+                           sprintf("%.3f", fdr_cell)), p_clone)]
+ggplot(od, aes(x = log2(OR), y = cluster, fill = dir)) +
+  geom_vline(xintercept = 0, colour = "#52514e", linewidth = 0.4) +
+  geom_col(width = 0.6) +
+  geom_errorbar(aes(xmin = log2(lo), xmax = log2(hi)), width = 0.18,
+                colour = "#52514e", linewidth = 0.4, orientation = "y") +
+  geom_text(aes(label = lab), x = 3.1, hjust = 0, size = 2.9, colour = "#52514e") +
+  scale_fill_manual(values = c("Enriched in persistence-biased" = "#2a78d6",
+                               "Enriched in expansion-biased"   = "#eb6834"), name = NULL) +
+  scale_x_continuous(breaks = c(-3,-2,-1,0,1), labels = function(x) round(2^x, 2),
+                     limits = c(-4.6, 8.6)) +
+  labs(title = "Infusion-product cluster enrichment by clone fate",
+       subtitle = paste("Cell-level Fisher odds ratio (95% CI), persistence- vs expansion-biased clones.",
+                        "\nNo cluster survives clone-level testing with patient adjustment."),
+       x = "Odds ratio (log scale)", y = NULL) +
+  theme_minimal(base_size = 10) +
+  theme(panel.grid.major.y = element_blank(), panel.grid.minor = element_blank(),
+        panel.grid.major.x = element_line(colour = "#ebeae6", linewidth = 0.3),
+        plot.title = element_text(face = "bold"), plot.title.position = "plot",
+        plot.subtitle = element_text(colour = "#52514e", size = 8.5, lineheight = 1.2),
+        legend.position = "bottom")
+```
+
+Each bar carries both verdicts deliberately: the cell-level FDR a naive analysis would report,
+and the clone-level patient-adjusted p-value that supersedes it. The CD8 effector bar
+(OR `r sprintf('%.2f', or_eff)`, cell FDR `r fmt_e(fdr_eff)`, clone-level p = `r sprintf('%.2f', pclone_eff)`) is the clearest case of the gap.
+
+Figures are written to `figures/`.
+
+::: {.callout-warning}
+**But it attenuates under stricter measurement filters**: restricting to better-observed clones
+gives p = 0.0012 (n = 76) → 0.099 (n = 48) → 0.109 (n = 34) → 0.83 (n = 23). The effect size
+stays negative and similar in the middle strata, so this is consistent with power loss rather
+than artefact, but it is not robust enough to call established. Treat as a hypothesis: lower CAR
+expression → less tonic signalling → better persistence is known CAR-T biology, and this data is
+consistent with it, but 76 clones in 5 patients cannot establish it.
+:::
+
+```{r}
+#| label: clone-save
+#| cache: false
+fwrite(grid[, .(pt, time, clone, prod_count, prod_freq, prod_car_frac, tp_total, obs,
+                expected, p_two, fdr, contraction_powered, call)],
+       file.path(proc_dir, "clone_tracking.csv.gz"))
+fwrite(cl_ph[, .(pt, clone, prod_count, prod_freq, obs_peak, tot_peak, obs_persistence,
+                 tot_persistence, p_shift, fdr_shift, phase_class)],
+       file.path(proc_dir, "clone_phase_shift.csv.gz"))
+rm(grid, g2, cl_ph, jm, jm2, prod, prod_phen, post_tp, tp_n, phase, ph, cc, prod_n, found,
+   drop_pt, both, a, b, m, n, k, A, B, M, N2, K, eps, p, v, tt, oo, fit)
+invisible(gc())
+```
+
+## Save objects
+
+```{r}
+#| label: save
+#| cache: false
+saveRDS(pre,  file.path(proc_dir, "seurat_pre_infusion_annotated.rds"))
+saveRDS(post, file.path(proc_dir, "seurat_post_infusion_annotated.rds"))
+```
+
+## Session info
+
+```{r}
+#| label: session-info
+sessionInfo()
+```
